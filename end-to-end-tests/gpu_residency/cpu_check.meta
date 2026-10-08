@@ -1,0 +1,47 @@
+[ccpp-table-properties]
+  name = cpu_check
+  type = scheme
+  dependencies =
+
+[ccpp-arg-table]
+  name = cpu_check_run
+  type = scheme
+[ncol]
+  standard_name = horizontal_dimension
+  units = count
+  dimensions = ()
+  type = integer
+  intent = in
+[nlev]
+  standard_name = vertical_layer_dimension
+  units = count
+  dimensions = ()
+  type = integer
+  intent = in
+[qv]
+  standard_name = water_vapor_mixing_ratio_wrt_dry_air
+  units = kg kg-1
+  dimensions = (horizontal_dimension, vertical_layer_dimension)
+  type = real
+  kind = kind_phys
+  intent = in
+[temp]
+  standard_name = air_temperature
+  units = K
+  dimensions = (horizontal_dimension, vertical_layer_dimension)
+  type = real
+  kind = kind_phys
+  intent = in
+[errmsg]
+  standard_name = ccpp_error_message
+  units = none
+  dimensions = ()
+  type = character
+  kind = len=*
+  intent = out
+[errflg]
+  standard_name = ccpp_error_code
+  units = 1
+  dimensions = ()
+  type = integer
+  intent = out

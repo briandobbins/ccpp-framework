@@ -46,6 +46,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from metadata.parse_tools import CCPPError, open_if_changed
 from metadata.variable_resolver import SchemeStore
+from generator import device_emit
 from generator.suite_resolver import (
     ResolvedArg,
     SuiteResolution,
@@ -1010,6 +1011,10 @@ def _generate_host_cap(
         )
 
     mod_name = '{}_ccpp_cap'.format(host_name)
+    # GPU data movement: suites with a residency plan get the sync entry
+    # points (empty unless --directive was given).
+    planned_suites = [r.suite_name for r in suite_resolutions
+                      if getattr(r, 'device_plan', None) is not None]
 
     lines: List[str] = []
     lines.append(
@@ -1032,6 +1037,9 @@ def _generate_host_cap(
         for phase in _PHYSICS_PHASES:
             suite_subs.append('{}_physics_{}'.format(sname, phase))
         suite_subs.append('{}_final'.format(sname))
+        if planned_suites and sname in planned_suites:
+            for direction in device_emit.SYNC_DIRECTIONS:
+                suite_subs.append(device_emit.suite_sync_sub_name(sname, direction))
         syms = ', '.join(suite_subs)
         use_lines.append('{}use {}, only: {}'.format(_INDENT, suite_cap_mod, syms))
     ensure_error_unit_use(use_lines, _INDENT)
@@ -1085,6 +1093,9 @@ def _generate_host_cap(
     pub_subs.append('ccpp_physics_suite_schemes')
     pub_subs.append('ccpp_physics_suite_variables')
     pub_subs.append('ccpp_physics_suite_host_data')
+    if planned_suites:
+        for direction in device_emit.SYNC_DIRECTIONS:
+            pub_subs.append(device_emit.host_sync_sub_name(direction))
     pub_subs.extend(constituent_pub_syms)
     for sub in pub_subs:
         lines.append('{}public :: {}'.format(_INDENT, sub))
@@ -1100,6 +1111,14 @@ def _generate_host_cap(
     for phase in _PHYSICS_PHASES:
         lines.extend(_physics_subroutine(phase, suite_names, suite_resolutions, host_dict))
     lines.extend(_final_subroutine(suite_names, host_dict))
+    if planned_suites:
+        sn_entry = host_dict.get('suite_name') if host_dict else None
+        lines.extend(device_emit.host_sync_subroutines(
+            planned_suites, suite_names,
+            sn_entry.local_name if sn_entry else 'suite_name',
+            _ctrl_local(host_dict, 'ccpp_error_message') or 'errmsg',
+            _ctrl_local(host_dict, 'ccpp_error_code') or 'errflg',
+            _INDENT))
     # Introspection routines (do not advance state, no scheme calls).
     # With --no-host-introspection, each routine retains its signature
     # but the body is replaced with an errflg=1 stub (or, for

@@ -1,0 +1,78 @@
+[ccpp-table-properties]
+  name = gpu_state_type
+  type = ddt
+  dependencies =
+[ccpp-arg-table]
+  name = gpu_state_type
+  type = ddt
+[ps]
+  standard_name = surface_air_pressure
+  long_name = surface air pressure
+  units = Pa
+  dimensions = (horizontal_dimension)
+  type = real
+  kind = kind_phys
+  host_access = read
+[precl]
+  standard_name = large_scale_precipitation_rate
+  long_name = large-scale precipitation rate
+  units = m s-1
+  dimensions = (horizontal_dimension)
+  type = real
+  kind = kind_phys
+
+[ccpp-table-properties]
+  name = gpu_data
+  type = host
+  dependencies =
+[ccpp-arg-table]
+  name = gpu_data
+  type = host
+[ncols]
+  standard_name = horizontal_dimension
+  long_name = horizontal dimension
+  units = count
+  dimensions = ()
+  type = integer
+[pver]
+  standard_name = vertical_layer_dimension
+  long_name = number of vertical layers
+  units = count
+  dimensions = ()
+  type = integer
+[temp]
+  standard_name = air_temperature
+  long_name = air temperature
+  units = K
+  dimensions = (horizontal_dimension, vertical_layer_dimension)
+  type = real
+  kind = kind_phys
+  host_access = read
+[qv]
+  standard_name = water_vapor_mixing_ratio_wrt_dry_air
+  long_name = water vapour mixing ratio
+  units = kg kg-1
+  dimensions = (horizontal_dimension, vertical_layer_dimension)
+  type = real
+  kind = kind_phys
+  host_access = none
+[use_extra]
+  standard_name = flag_for_extra_forcing
+  long_name = flag that turns the optional extra forcing on
+  units = flag
+  dimensions = ()
+  type = logical
+[extra]
+  standard_name = extra_temperature_forcing
+  long_name = optional extra temperature forcing
+  units = K
+  dimensions = (horizontal_dimension, vertical_layer_dimension)
+  type = real
+  kind = kind_phys
+  active = (flag_for_extra_forcing)
+[phys_state]
+  standard_name = gpu_test_physics_state
+  long_name = physics state container
+  units = DDT
+  dimensions = ()
+  type = gpu_state_type

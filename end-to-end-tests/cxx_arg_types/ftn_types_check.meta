@@ -1,0 +1,100 @@
+[ccpp-table-properties]
+  name = ftn_types_check
+  type = scheme
+  dependencies =
+
+[ccpp-arg-table]
+  name = ftn_types_check_run
+  type = scheme
+[ncol]
+  standard_name = horizontal_dimension
+  units = count
+  dimensions = ()
+  type = integer
+  intent = in
+[nlev]
+  standard_name = vertical_layer_dimension
+  units = count
+  dimensions = ()
+  type = integer
+  intent = in
+[use_extra]
+  standard_name = flag_for_extra_forcing
+  units = flag
+  dimensions = ()
+  type = logical
+  intent = inout
+[extra]
+  standard_name = extra_temperature_forcing
+  units = K
+  dimensions = (horizontal_dimension, vertical_layer_dimension)
+  type = real
+  kind = kind_phys
+  intent = in
+  optional = True
+[col_start]
+  standard_name = horizontal_loop_begin
+  units = index
+  dimensions = ()
+  type = integer
+  intent = in
+[state]
+  standard_name = gpu_test_physics_state
+  units = DDT
+  dimensions = ()
+  type = gpu_state_type
+  intent = in
+[temp]
+  standard_name = air_temperature
+  units = K
+  dimensions = (horizontal_dimension, vertical_layer_dimension)
+  type = real
+  kind = kind_phys
+  intent = in
+[mask]
+  standard_name = cold_layer_mask
+  units = flag
+  dimensions = (horizontal_dimension, vertical_layer_dimension)
+  type = logical
+  intent = in
+[work]
+  standard_name = cxx_allocated_work_array
+  units = 1
+  dimensions = (horizontal_dimension)
+  type = real
+  kind = kind_phys
+  intent = in
+  allocatable = True
+[warm]
+  standard_name = warm_layer_mask
+  units = flag
+  dimensions = (horizontal_dimension, vertical_layer_dimension)
+  type = logical
+  intent = in
+[any_warm]
+  standard_name = flag_for_any_warm_layer
+  units = flag
+  dimensions = ()
+  type = logical
+  intent = in
+[gwork]
+  standard_name = cxx_gpu_allocated_work_array
+  units = 1
+  dimensions = (horizontal_dimension)
+  type = real
+  kind = kind_phys
+  intent = in
+  allocatable = True
+[errmsg]
+  standard_name = ccpp_error_message
+  units = none
+  dimensions = ()
+  type = character
+  kind = len=512
+  intent = out
+[errflg]
+  standard_name = ccpp_error_code
+  units = 1
+  dimensions = ()
+  type = integer
+  intent = out

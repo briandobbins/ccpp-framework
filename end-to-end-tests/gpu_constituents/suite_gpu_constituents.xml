@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<suite name="gpu_const_suite" version="2.0">
+  <group name="phys">
+    <scheme>const_reg</scheme>
+    <scheme>gpu_liq</scheme>
+    <scheme>cpu_ice</scheme>
+    <scheme>gpu_apply</scheme>
+  </group>
+  <group name="diag">
+    <scheme>cpu_check_const</scheme>
+  </group>
+</suite>

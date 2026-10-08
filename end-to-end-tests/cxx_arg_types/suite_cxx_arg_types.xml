@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<suite name="gpu_residency_suite" version="2.0">
+  <group name="before">
+    <scheme>cxx_types</scheme>
+    <scheme>cxx_types_gpu</scheme>
+    <scheme>ftn_types_check</scheme>
+  </group>
+  <group name="after">
+    <scheme>ftn_types_after</scheme>
+  </group>
+</suite>

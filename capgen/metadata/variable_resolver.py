@@ -46,6 +46,7 @@ the corresponding variable's local name and the code generator emits
 ``1:<local_name>``.
 """
 
+import os
 import re
 from typing import Dict, List, Optional
 
@@ -283,13 +284,19 @@ class HostVarEntry:
     active : str
         Fortran conditional expression in standard names; empty if always
         active.
+    memory_space : str
+        ``'host'`` (default) or ``'device'`` (the host maintains the device
+        copy itself).
+    host_access : str
+        ``'read_write'`` (default), ``'read'`` or ``'none'``: what host code
+        does with the variable between CCPP calls.
     """
 
     __slots__ = (
         'standard_name', 'local_name', 'access_path', 'module_name',
         'type', 'kind', 'units', 'dimensions',
         'protected', 'optional', 'allocatable', 'active', 'local_subscript',
-        'top_at_one',
+        'top_at_one', 'memory_space', 'host_access',
     )
 
     def __init__(
@@ -308,6 +315,8 @@ class HostVarEntry:
         local_subscript: Optional[List[str]] = None,
         allocatable: bool = False,
         top_at_one: bool = False,
+        memory_space: str = 'host',
+        host_access: str = 'read_write',
     ):
         self.standard_name    = standard_name
         self.local_name       = local_name
@@ -323,6 +332,12 @@ class HostVarEntry:
         self.active           = active
         self.local_subscript  = list(local_subscript) if local_subscript else []
         self.top_at_one       = top_at_one
+        # GPU data movement: ``memory_space == 'device'`` means the host
+        # allocates and maintains the device copy itself; ``host_access``
+        # is the host's promise about what its own code does with the
+        # variable between CCPP calls.  See doc/gpu_data_movement_plan.md.
+        self.memory_space     = memory_space or 'host'
+        self.host_access      = host_access or 'read_write'
 
     @property
     def is_control(self) -> bool:
@@ -457,6 +472,8 @@ def _flatten_ddt_instance(
     access_prefix: str = '',
     depth: int = 0,
     max_depth: int = 8,
+    inherit_memory_space: str = '',
+    inherit_host_access: str = '',
 ) -> List[HostVarEntry]:
     """Expand a DDT instance variable into flat ``HostVarEntry`` objects.
 
@@ -534,6 +551,11 @@ def _flatten_ddt_instance(
 
     entries: List[HostVarEntry] = []
 
+    # GPU data-movement attributes: a field without its own value inherits
+    # the enclosing instance's (which may itself be inherited).
+    inst_memory_space = var.memory_space or inherit_memory_space
+    inst_host_access  = var.host_access or inherit_host_access
+
     # The DDT instance variable itself — keyed by its own standard_name.
     entries.append(HostVarEntry(
         standard_name=var.standard_name,
@@ -550,6 +572,8 @@ def _flatten_ddt_instance(
         local_subscript=[],
         allocatable=var.allocatable,
         top_at_one=var.top_at_one,
+        memory_space=inst_memory_space,
+        host_access=inst_host_access,
     ))
 
     # When the DDT-instance carries non-registered dims (skip_recurse),
@@ -572,6 +596,8 @@ def _flatten_ddt_instance(
                     access_prefix=instance_access + '%',
                     depth=depth + 1,
                     max_depth=max_depth,
+                    inherit_memory_space=inst_memory_space,
+                    inherit_host_access=inst_host_access,
                 ))
             else:
                 # Rule 2: a leaf DDT field cannot carry a registered
@@ -602,6 +628,8 @@ def _flatten_ddt_instance(
                     local_subscript=sub_tokens,
                     allocatable=field.allocatable,
                     top_at_one=field.top_at_one,
+                    memory_space=field.memory_space or inst_memory_space,
+                    host_access=field.host_access or inst_host_access,
                 ))
 
     return entries
@@ -730,6 +758,8 @@ def build_flat_host_dict(
                         local_subscript=sub_tokens,
                         allocatable=var.allocatable,
                         top_at_one=var.top_at_one,
+                        memory_space=var.memory_space,
+                        host_access=var.host_access,
                     ), tbl.table_name)
                 else:
                     raise CCPPError(
@@ -780,6 +810,35 @@ def build_flat_host_dict(
 # SchemeStore
 ########################################################################
 
+_MODULE_RE = re.compile(r'^\s*module\s+(?!procedure\b)(\w+)\s*(?:!.*)?$',
+                        re.IGNORECASE)
+
+
+def _source_module(meta_path: Optional[str]) -> str:
+    """Return the module declared in the Fortran file paired with *meta_path*.
+
+    Original capgen read the module name from the scheme's source, so
+    several schemes may share one module (e.g. CAM-SIMA's
+    ``compute_subgrid_vertical_velocity.F90`` holds the ``_tke`` and
+    ``_clubb`` schemes) without declaring ``module_name``.  Returns ''
+    when there is no paired source or it does not declare exactly one
+    module, so the caller falls back to the scheme name.
+    """
+    if not meta_path:
+        return ''
+    base = os.path.splitext(meta_path)[0]
+    for ext in ('.F90', '.f90', '.F', '.f'):
+        src = base + ext
+        if os.path.isfile(src):
+            try:
+                with open(src, errors='replace') as fh:
+                    mods = [m.group(1) for m in map(_MODULE_RE.match, fh) if m]
+            except OSError:
+                return ''
+            return mods[0] if len(mods) == 1 else ''
+    return ''
+
+
 class SchemeStore:
     """Organises scheme metadata for variable resolution.
 
@@ -801,6 +860,12 @@ class SchemeStore:
         # duplicate-phase error path so the message can name both the
         # original registration site and the duplicate.
         self._source_paths: Dict[str, Dict[str, str]] = {}
+        # _phase_memory_space[scheme_name][phase] = the ``memory_space``
+        # default declared in that phase's ``[ccpp-arg-table]`` header
+        # ('' when not set).  GPU data movement; see memory_space_for.
+        self._phase_memory_space: Dict[str, Dict[str, str]] = {}
+        # _languages[scheme_name] = 'fortran' or 'c++'.
+        self._languages: Dict[str, str] = {}
         # Memoised set of constituent standard names (base + tendency;
         # see constituent_stdnames); None until first computed.
         self._const_stds: Optional[frozenset] = None
@@ -833,7 +898,8 @@ class SchemeStore:
             # properties overrides the implicit "module name equals scheme
             # name" convention.  See doc/scheme metadata format.
             mod = tbl.module_name.strip() if tbl.module_name else ''
-            store._modules[name] = mod or name
+            store._modules[name] = mod or _source_module(tbl.file_path) or name
+            store._languages[name] = getattr(tbl, 'language', 'fortran')
             for sec in tbl.sections():
                 if sec.phase is None:
                     continue
@@ -861,6 +927,8 @@ class SchemeStore:
                     )
                 store._data[name][sec.phase] = list(sec.variables)
                 store._source_paths[name][sec.phase] = tbl.file_path or '<unknown>'
+                store._phase_memory_space.setdefault(name, {})[sec.phase] = (
+                    getattr(sec, 'memory_space', '') or '')
         return store
 
     def scheme_names(self) -> List[str]:
@@ -932,6 +1000,22 @@ class SchemeStore:
             return None
         inner = phases.get(phase)
         return list(inner) if inner is not None else None
+
+    def language_for(self, name: str) -> str:
+        """Return scheme *name*'s implementation language ('fortran' or
+        'c++')."""
+        return self._languages.get(name, 'fortran')
+
+    def memory_space_for(self, name: str, phase: str,
+                         local_name: str) -> str:
+        """Return the effective ``memory_space`` of argument *local_name*
+        of scheme *name*'s *phase*: the argument's own value, else the
+        phase's ``[ccpp-arg-table]`` default, else ``'host'``."""
+        default = self._phase_memory_space.get(name, {}).get(phase, '')
+        for var in self._data.get(name, {}).get(phase, []):
+            if var.local_name == local_name:
+                return var.memory_space or default or 'host'
+        return default or 'host'
 
     def __repr__(self) -> str:
         return "SchemeStore(schemes={})".format(self.scheme_names())

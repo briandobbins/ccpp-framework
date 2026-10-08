@@ -1,0 +1,43 @@
+[ccpp-table-properties]
+  name = gpu_apply
+  type = scheme
+  dependencies =
+
+[ccpp-arg-table]
+  name = gpu_apply_run
+  type = scheme
+  memory_space = device
+[ dt ]
+  standard_name = time_step_for_physics
+  units = s
+  dimensions = ()
+  type = real
+  kind = kind_phys
+  intent = in
+[ const_tend ]
+  standard_name = ccpp_constituent_tendencies
+  units = none
+  dimensions = (horizontal_dimension, vertical_layer_dimension, number_of_ccpp_constituents)
+  type = real
+  kind = kind_phys
+  intent = inout
+[ const ]
+  standard_name = ccpp_constituents
+  units = none
+  dimensions = (horizontal_dimension, vertical_layer_dimension, number_of_ccpp_constituents)
+  type = real
+  kind = kind_phys
+  intent = inout
+[ errmsg ]
+  standard_name = ccpp_error_message
+  units = none
+  dimensions = ()
+  type = character
+  kind = len=512
+  intent = out
+[ errcode ]
+  standard_name = ccpp_error_code
+  units = 1
+  dimensions = ()
+  type = integer
+  intent = out

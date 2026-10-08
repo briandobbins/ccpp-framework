@@ -1243,6 +1243,23 @@ class TestSchemeStore(unittest.TestCase):
         self.assertIn('run', str(cm.exception))
         self.assertIn('my_scheme', str(cm.exception))
 
+    def test_module_from_paired_source(self):
+        """Without ``module_name``, the module comes from the paired
+        Fortran source (original capgen's rule), so two schemes can share
+        one module; with no source, it falls back to the scheme name."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            meta = os.path.join(tmp, 'shared_mod.meta')
+            with open(os.path.join(tmp, 'shared_mod.F90'), 'w') as fh:
+                fh.write('! comment\nmodule shared_mod  ! two schemes\n'
+                         '  interface x\n    module procedure y\n'
+                         '  end interface\nend module shared_mod\n')
+            tables = _parse_lines(
+                _SIMPLE_SCHEME_SRC.splitlines(keepends=True), meta)
+            store = SchemeStore.build_from(tables)
+            self.assertEqual(store.module_for('my_scheme'), 'shared_mod')
+        self.assertEqual(self._build().module_for('my_scheme'), 'my_scheme')
+
     def test_duplicate_phase_names_both_source_files(self):
         """When two distinct ``.meta`` files declare the same
         (scheme, phase) pair, the error must name both file paths so

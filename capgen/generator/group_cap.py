@@ -37,6 +37,8 @@ from generator.suite_resolver import (
     iter_phase_calls,
     iter_phase_subcycles,
 )
+from generator import device_emit
+from generator.timers import TimerRegistry, split_by_direction as split_timer_runs
 from generator.trace import (
     emit_module_gate,
     emit_trace_block,
@@ -126,6 +128,14 @@ def _fortran_type_str(type_: str, kind: str) -> str:
         if t.lower().startswith('character'):
             return 'character({})'.format(kind)
         return '{}(kind={})'.format(t, kind)
+    return t
+
+
+def _ddt_type_name(type_: str) -> str:
+    """Bare derived-type name from metadata ``type`` (``type(x)`` or ``x``)."""
+    t = type_.strip()
+    if t.lower().startswith('type('):
+        t = t[t.index('(') + 1:t.rindex(')')].strip()
     return t
 
 
@@ -303,6 +313,12 @@ def _collect_group_uses(
                 if arg.source == 'constituent' and arg.constituent_module_name:
                     for sym in arg.constituent_extra_symbols:
                         _add(arg.constituent_module_name, sym)
+                # Per-call derived-type objects (assign_run_local_ddts) are
+                # declared in the run subroutine, so their type is needed.
+                sv = arg.suite_var
+                if (sv is not None and sv.run_local_group == resolved_group.group_name
+                        and sv.run_local_type_module):
+                    _add(sv.run_local_type_module, _ddt_type_name(sv.type_))
 
     # Also add dim_uses already collected during resolution.
     for mod, syms in resolved_group.dim_uses.items():
@@ -458,6 +474,9 @@ def _collect_scheme_uses(resolved_group: ResolvedGroup) -> List[Tuple[str, str, 
     order: List[str] = []
     for phase in _GROUP_PHASE_ORDER:
         for resolved_call in iter_phase_calls(resolved_group.phase_calls.get(phase, [])):
+            if getattr(resolved_call, 'language', 'fortran') == 'c++':
+                # Reached through a BIND(C) interface block, not a USE.
+                continue
             if resolved_call.scheme_name not in seen_schemes:
                 seen_schemes[resolved_call.scheme_name] = set()
                 order.append(resolved_call.scheme_name)
@@ -716,6 +735,23 @@ def _loop_counter_name(depth: int) -> str:
     return 'ccpp_loop_counter_{}'.format(depth)
 
 
+def _timed_update_lines(updates, indent: str, pplan, timers,
+                        label: str) -> List[str]:
+    """Planned updates, each run of one direction wrapped in a
+    ``<label>_h2d`` / ``<label>_d2h`` timer when *timers* is given."""
+    if timers is None:
+        return device_emit.update_lines(updates, indent, trace=pplan.trace,
+                                        directive=pplan.directive)
+    out: List[str] = []
+    for direction, run in split_timer_runs(updates):
+        name = '{}_{}'.format(label, direction)
+        out.append(timers.start(name, indent))
+        out.extend(device_emit.update_lines(run, indent, trace=pplan.trace,
+                                            directive=pplan.directive))
+        out.append(timers.stop(name, indent))
+    return out
+
+
 def _emit_phase_items(
     items, indent: str, lines: List[str], depth: int,
     phase: str = '',
@@ -724,6 +760,8 @@ def _emit_phase_items(
     logger=None,
     suite_name: str = '',
     group_name: str = '',
+    pplan=None,
+    timers=None,
 ) -> None:
     """Recursively emit Fortran for a list of :data:`PhaseItem` objects.
 
@@ -737,9 +775,14 @@ def _emit_phase_items(
             _emit_one_call(
                 item, indent, lines, phase, errflg_local, errmsg_local,
                 logger=logger, suite_name=suite_name, group_name=group_name,
+                pplan=pplan, timers=timers,
             )
         elif isinstance(item, ResolvedSubcycle):
             counter = _loop_counter_name(depth)
+            if pplan is not None and id(item) in pplan.loop_entry:
+                lines.extend(_timed_update_lines(
+                    pplan.loop_entry[id(item)], indent, pplan, timers,
+                    '{}_{}_loop'.format(group_name, phase)))
             lines.append(
                 '{}do {} = 1, {}'.format(indent, counter, item.loop)
             )
@@ -749,6 +792,7 @@ def _emit_phase_items(
                 errflg_local=errflg_local,
                 errmsg_local=errmsg_local,
                 logger=logger, suite_name=suite_name, group_name=group_name,
+                pplan=pplan, timers=timers,
             )
             lines.append('{}end do'.format(indent))
             lines.append('')
@@ -764,6 +808,8 @@ def _emit_one_call(
     logger=None,
     suite_name: str = '',
     group_name: str = '',
+    pplan=None,
+    timers=None,
 ) -> None:
     """Append Fortran lines for a single scheme call (with transforms + errcheck).
 
@@ -783,6 +829,23 @@ def _emit_one_call(
             errflg_local, errmsg_local, indent,
         ))
 
+    # GPU data movement: checks and updates that make the copies this call
+    # reads valid.  Before the transforms, which read host copies.
+    if pplan is not None:
+        lines.extend(device_emit.check_lines(
+            pplan.pre_checks.get(id(resolved_call), []), indent,
+            errmsg_local or 'errmsg', errflg_local or 'errflg',
+            '{}_{}_{}'.format(suite_name, group_name, phase),
+            unified=pplan.unified, directive=pplan.directive))
+        lines.extend(_timed_update_lines(
+            pplan.pre.get(id(resolved_call), []), indent, pplan, timers,
+            '{}_{}'.format(resolved_call.scheme_name, resolved_call.phase)))
+        lines.extend(device_emit.check_lines(
+            pplan.trace_checks.get(id(resolved_call), []), indent,
+            errmsg_local or 'errmsg', errflg_local or 'errflg',
+            '{}_{}_{}'.format(suite_name, group_name, phase),
+            unified=pplan.unified, directive=pplan.directive))
+
     # Pre-call transformations (and log each on capgen's stdout/stderr).
     for arg in resolved_call.args:
         lines.extend(_pre_call_lines(arg))
@@ -791,11 +854,37 @@ def _emit_one_call(
                                resolved_call.phase, resolved_call.scheme_name,
                                arg, reverse=False)
 
+    # GPU data movement: device-side array arguments of a C++ scheme go
+    # through dense device scratch arrays (see device_emit.cxx_pack_lines).
+    pack_after: List[str] = []
+    overrides: Dict[str, str] = {}
+    call_name = '{}_{}'.format(resolved_call.scheme_name, resolved_call.phase)
+    if timers is not None:
+        lines.append(timers.start(call_name, indent))
+    if pplan is not None and id(resolved_call) in pplan.cxx_pack:
+        pack_before, pack_after, overrides = device_emit.cxx_pack_lines(
+            pplan.cxx_pack[id(resolved_call)], indent, pplan.directive,
+            pplan.unified)
+        lines.extend(pack_before)
+    # C++ scheme: logical temporaries, derived-type descriptors, allocatable
+    # handling (see cxx_schemes.CallWrap).
+    wrap = getattr(resolved_call, 'cxx_wrap', None)
+    if wrap is not None:
+        wrap_before, wrap_after, wrap_over = wrap.lines(
+            indent, {a.scheme_local_name: overrides.get(a.scheme_local_name,
+                                                        _call_arg_expr(a))
+                     for a in resolved_call.args},
+            pointers={a.scheme_local_name for a in resolved_call.args
+                      if a.transform_case in (2, 4)},
+            packed=set(overrides))
+        lines.extend(wrap_before)
+        overrides = dict(overrides, **wrap_over)
+        pack_after = wrap_after + pack_after
     call_args_exprs = [
-        '{}={}'.format(a.scheme_local_name, _call_arg_expr(a))
+        '{}={}'.format(a.scheme_local_name,
+                       overrides.get(a.scheme_local_name, _call_arg_expr(a)))
         for a in resolved_call.args
     ]
-    call_name = '{}_{}'.format(resolved_call.scheme_name, resolved_call.phase)
 
     if call_args_exprs:
         lines.append('{}call {}( &'.format(indent, call_name))
@@ -805,11 +894,28 @@ def _emit_one_call(
     else:
         lines.append('{}call {}()'.format(indent, call_name))
 
+    lines.extend(pack_after)
+    if timers is not None:
+        if pplan is not None and id(resolved_call) in pplan.device_calls:
+            # Count the device work, not just its launch.
+            lines.extend(device_emit.wait_lines(indent, pplan.directive))
+        lines.append(timers.stop(call_name, indent))
     errflg_arg = next(
         (a for a in resolved_call.args if a.standard_name == 'ccpp_error_code'), None
     )
     if errflg_arg is not None:
         lines.append('{}if ({} /= 0) return'.format(indent, _call_arg_expr(errflg_arg)))
+
+    # Suite variables sized by this (init-phase) call: allocate them now
+    # (see suite_resolver.validate_init_dimensions).
+    for da in getattr(resolved_call, 'deferred_allocs', None) or []:
+        lines.append('{}! ccpp: allocate {} now that {} has set its size'.format(
+            indent, da.standard_name, resolved_call.scheme_name))
+        lines.append('{}if (.not. allocated({})) then'.format(indent, da.access))
+        lines.append('{}  allocate({}({}))'.format(indent, da.access, da.shape))
+        if da.device_create is not None:
+            lines.extend(device_emit._directive(indent + '  ', *da.device_create))
+        lines.append('{}end if'.format(indent))
 
     for arg in resolved_call.args:
         lines.extend(_post_call_lines(arg))
@@ -817,6 +923,15 @@ def _emit_one_call(
             _log_one_transform(logger, suite_name, group_name,
                                resolved_call.phase, resolved_call.scheme_name,
                                arg, reverse=True)
+    if pplan is not None:
+        lines.extend(_timed_update_lines(
+            pplan.post.get(id(resolved_call), []), indent, pplan, timers,
+            call_name))
+        lines.extend(device_emit.check_lines(
+            pplan.post_checks.get(id(resolved_call), []), indent,
+            errmsg_local or 'errmsg', errflg_local or 'errflg',
+            '{}_{}_{}'.format(suite_name, group_name, phase),
+            unified=pplan.unified, directive=pplan.directive))
     lines.append('')
 
 
@@ -908,6 +1023,8 @@ def _generate_phase_subroutine(
     ctrl_entries,
     host_dict,
     logger=None,
+    pplan=None,
+    timers=None,
 ) -> List[str]:
     """Generate one phase subroutine for a group cap.
 
@@ -997,6 +1114,20 @@ def _generate_phase_subroutine(
                     '{}type({}) :: {}'.format(_INDENT * 2, ptr_tname, arg.ptr_name)
                 )
 
+    # Derived-type objects with a per-call lifetime (assign_run_local_ddts):
+    # fresh on every call of this run phase, as capgen v0 made them.
+    if phase == 'run':
+        seen_run_locals: Set[str] = set()
+        for resolved_call in iter_phase_calls(phase_items):
+            for arg in resolved_call.args:
+                sv = arg.suite_var
+                if (sv is None or sv.run_local_group != group_name
+                        or sv.run_local_name in seen_run_locals):
+                    continue
+                seen_run_locals.add(sv.run_local_name)
+                local_decls.append('{}type({}) :: {}'.format(
+                    _INDENT * 2, _ddt_type_name(sv.type_), sv.run_local_name))
+
     if local_decls:
         lines.append('')
         lines.extend(local_decls)
@@ -1034,6 +1165,14 @@ def _generate_phase_subroutine(
         )
     )
 
+    # ---- GPU data movement: entry checks (--device-debug) ---------------
+    if pplan is not None and pplan.entry_checks:
+        lines.extend(device_emit.check_lines(
+            pplan.entry_checks, call_indent, errmsg_local or 'errmsg',
+            errflg_local or 'errflg', sub_label,
+            unified=pplan.unified, directive=pplan.directive))
+        lines.append('')
+
     # ---- scheme calls ---------------------------------------------------
     # Transforms are logged inside _emit_one_call (same text as the inline
     # cap comments), so group caps and suite <init>/<final> hooks share one
@@ -1044,7 +1183,18 @@ def _generate_phase_subroutine(
         errflg_local=errflg_local,
         errmsg_local=errmsg_local,
         logger=logger, suite_name=suite_name, group_name=group_name,
+        pplan=pplan, timers=timers,
     )
+
+    # ---- GPU data movement: restore the handoff state --------------------
+    if pplan is not None and (pplan.exit or pplan.exit_checks):
+        lines.extend(_timed_update_lines(pplan.exit, call_indent, pplan,
+                                         timers, '{}_{}_exit'.format(group_name, phase)))
+        lines.extend(device_emit.check_lines(
+            pplan.exit_checks, call_indent, errmsg_local or 'errmsg',
+            errflg_local or 'errflg', sub_label,
+            unified=pplan.unified, directive=pplan.directive))
+        lines.append('')
 
     # ---- post-call state transitions ------------------------------------
     if phase == 'init':
@@ -1256,6 +1406,11 @@ def _generate_group_cap(
     host_dict,
     trace: bool = False,
     logger=None,
+    device_plan=None,
+    cxx_interfaces: Optional[List[str]] = None,
+    timer_style: Optional[str] = None,
+    cxx_uses: Optional[List[str]] = None,
+    cxx_helpers: Optional[List[str]] = None,
 ) -> List[str]:
     """Generate the full group cap module source lines.
 
@@ -1285,6 +1440,26 @@ def _generate_group_cap(
     dealloc_sub = '{}_state_dealloc'.format(group_name)
     lines: List[str] = []
 
+    # ---- subroutines per phase (generated first: the timers they use are
+    # declared in the module header) ----------------------------------------
+    # All phases share the same uniform control arg signature (excluding
+    # suite_name and group_name which are consumed at higher dispatch levels).
+    timers = TimerRegistry(timer_style) if timer_style else None
+    ctrl_sig_entries = _ctrl_entries_for_signature(
+        host_dict, exclude={'suite_name', 'group_name'}
+    )
+    phase_lines: List[str] = []
+    for phase in _GROUP_PHASE_ORDER:
+        phase_items = resolved_group.phase_calls.get(phase, [])
+        phase_lines.extend(_generate_phase_subroutine(
+            suite_name, group_name, phase, phase_items, ctrl_sig_entries,
+            host_dict, logger=logger,
+            pplan=(device_plan.phase_plan(group_name, phase)
+                   if device_plan is not None else None),
+            timers=timers,
+        ))
+        phase_lines.append('')
+
     # ---- module header --------------------------------------------------
     lines.append(
         '! ccpp_{}_{}_cap.F90 -- generated by ccpp_capgen, do not edit'.format(
@@ -1296,6 +1471,12 @@ def _generate_group_cap(
 
     # ---- USE statements -------------------------------------------------
     uses = _collect_group_uses(resolved_group, host_dict)
+    # Allocations scheduled after init-phase calls (prepare_deferred_allocations).
+    for items in resolved_group.phase_calls.values():
+        for resolved_call in iter_phase_calls(items):
+            for da in getattr(resolved_call, 'deferred_allocs', None) or []:
+                for mod, syms in da.uses.items():
+                    uses.setdefault(mod, set()).update(syms)
 
     # Add USE for types module when optional pointer args are present.
     # Build the wrapper name via the per-arg helper so any
@@ -1316,6 +1497,11 @@ def _generate_group_cap(
     # USE ccpp_kinds for any kind parameter referenced in transformation
     # temporaries declared in this group (e.g. ``real(kind=kind_phys)``).
     kind_names = _collect_kinds_used(resolved_group)
+    if device_plan is not None:
+        # --device-debug coherence checks declare scratch arrays of the
+        # checked arrays' kinds.
+        kind_names = list(kind_names) + device_emit.check_kinds(
+            device_plan, group_name)
     if kind_names:
         uses['ccpp_kinds'] = set(kind_names)
 
@@ -1323,12 +1509,25 @@ def _generate_group_cap(
     use_lines.extend(_scheme_use_statements(resolved_group))
     # Trace block writes to error_unit; ensure the USE is present.
     ensure_error_unit_use(use_lines, _INDENT)
+    if device_plan is not None and not device_plan.options.unified \
+            and (device_plan.options.debug or device_plan.options.trace):
+        # --device-debug presence checks and --device-trace query the
+        # directive runtime (acc_is_present / omp_target_is_present).
+        for line in device_emit.spelling(device_plan.options.directive).uses:
+            use_lines.append('{}{}'.format(_INDENT, line))
+    if timers is not None:
+        use_lines.extend(timers.use_lines())
+    if cxx_uses:
+        use_lines.extend(cxx_uses)
     lines.extend(use_lines)
     if use_lines:
         lines.append('')
 
     lines.append('{}implicit none'.format(_INDENT))
     lines.append('{}private'.format(_INDENT))
+    if cxx_interfaces:
+        lines.append('')
+        lines.extend(cxx_interfaces)
 
     # Public physics subroutines, in canonical phase order.
     # Always emit all phases so the suite cap can rely on the state machine
@@ -1356,31 +1555,27 @@ def _generate_group_cap(
     # but the control dummies remain syntactically referenced, which
     # silences strict unused-dummy warnings (Intel oneAPI in particular).
     lines.extend(emit_module_gate(trace, _INDENT))
+    if timers is not None:
+        lines.extend(timers.declaration_lines())
 
     lines.append('')
     lines.append('contains')
     lines.append('')
 
-    # ---- subroutines per phase ------------------------------------------
-    # All phases share the same uniform control arg signature (excluding
-    # suite_name and group_name which are consumed at higher dispatch levels).
-    ctrl_sig_entries = _ctrl_entries_for_signature(
-        host_dict, exclude={'suite_name', 'group_name'}
-    )
-    for phase in _GROUP_PHASE_ORDER:
-        phase_items = resolved_group.phase_calls.get(phase, [])
-        sub_lines = _generate_phase_subroutine(
-            suite_name, group_name, phase, phase_items, ctrl_sig_entries,
-            host_dict, logger=logger,
-        )
-        lines.extend(sub_lines)
-        lines.append('')
+    lines.extend(phase_lines)
 
     # ---- state management subroutines -----------------------------------
     lines.extend(_generate_state_alloc(suite_name, group_name))
     lines.append('')
     lines.extend(_generate_state_dealloc(suite_name, group_name))
     lines.append('')
+    if device_emit.needs_omp_present_helper(device_plan, group_name):
+        lines.extend(device_emit.OMP_PRESENT_HELPER)
+        lines.append('')
+    if timers is not None:
+        lines.extend(timers.helper_lines())
+    if cxx_helpers:
+        lines.extend(cxx_helpers)
 
     lines.append('end module {}'.format(mod_name))
     return lines
@@ -1408,6 +1603,11 @@ def write_group_cap(
     output_root: str,
     logger: Optional[logging.Logger] = None,
     trace: bool = False,
+    device_plan=None,
+    cxx_interfaces: Optional[List[str]] = None,
+    timer_style: Optional[str] = None,
+    cxx_uses: Optional[List[str]] = None,
+    cxx_helpers: Optional[List[str]] = None,
 ) -> str:
     """Write the group cap Fortran module to *output_root*.
 
@@ -1433,7 +1633,9 @@ def write_group_cap(
 
     lines = _generate_group_cap(
         suite_name, group_name, resolved_group, host_dict, trace=trace,
-        logger=logger,
+        logger=logger, device_plan=device_plan,
+        cxx_interfaces=cxx_interfaces, timer_style=timer_style,
+        cxx_uses=cxx_uses, cxx_helpers=cxx_helpers,
     )
     with open_if_changed(out_path, logger=logger) as fh:
         fh.write('\n'.join(lines) + '\n')

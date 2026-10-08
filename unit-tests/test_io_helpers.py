@@ -49,8 +49,10 @@ class TestWriteIfChanged(unittest.TestCase):
 
     def test_skips_write_when_content_identical(self):
         write_if_changed(self._path, 'hello\n')
-        # Set an old mtime so we can detect any rewrite.
-        old_mtime = time.time() - 3600
+        # Set an old mtime so we can detect any rewrite.  Whole seconds:
+        # some filesystems (e.g. Derecho's scratch, where TMPDIR points)
+        # store mtimes only to the second.
+        old_mtime = int(time.time()) - 3600
         os.utime(self._path, (old_mtime, old_mtime))
         observed = os.path.getmtime(self._path)
 
@@ -61,7 +63,7 @@ class TestWriteIfChanged(unittest.TestCase):
 
     def test_rewrites_when_content_differs(self):
         write_if_changed(self._path, 'hello\n')
-        old_mtime = time.time() - 3600
+        old_mtime = int(time.time()) - 3600
         os.utime(self._path, (old_mtime, old_mtime))
 
         wrote = write_if_changed(self._path, 'goodbye\n')
@@ -117,7 +119,7 @@ class TestOpenIfChanged(unittest.TestCase):
     def test_idempotent_no_mtime_bump(self):
         with open_if_changed(self._path) as fh:
             fh.write('stable\n')
-        old_mtime = time.time() - 3600
+        old_mtime = int(time.time()) - 3600
         os.utime(self._path, (old_mtime, old_mtime))
 
         with open_if_changed(self._path) as fh:

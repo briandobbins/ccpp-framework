@@ -1,0 +1,14 @@
+Deliberately broken variants for the --device-debug checks (build.sh OVERRIDE=...).
+
+bad_intent       gpu_heat.F90 writes surface pressure on the device although
+                 its metadata declares it intent(in).  Expected with
+                 gpu-debug: a coherence error right after gpu_heat_run.
+bad_host_access  gpu_data.meta promises host_access = read for air
+                 temperature, but main.F90 changes it between the groups.
+                 Expected with gpu-debug: a coherence error at the entry of
+                 the 'after' group.
+bad_realloc      main.F90 reallocates air temperature after ccpp_init created
+                 its device copy (hosts must not do this).  Expected: with
+                 gpu-trace, a WARNING that temp is not present before the
+                 first GPU call (then the runtime aborts); with gpu-debug, a
+                 clean error naming temp and the call instead of a crash.

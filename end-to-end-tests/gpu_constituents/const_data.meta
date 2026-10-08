@@ -1,0 +1,29 @@
+[ccpp-table-properties]
+  name = const_data
+  type = host
+  dependencies =
+[ccpp-arg-table]
+  name = const_data
+  type = host
+[ncols]
+  standard_name = horizontal_dimension
+  units = count
+  dimensions = ()
+  type = integer
+[pver]
+  standard_name = vertical_layer_dimension
+  units = count
+  dimensions = ()
+  type = integer
+[dt]
+  standard_name = time_step_for_physics
+  units = s
+  dimensions = ()
+  type = real
+  kind = kind_phys
+[temp]
+  standard_name = air_temperature
+  units = K
+  dimensions = (horizontal_dimension, vertical_layer_dimension)
+  type = real
+  kind = kind_phys

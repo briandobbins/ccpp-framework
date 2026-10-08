@@ -1,0 +1,81 @@
+[ccpp-table-properties]
+  name = cxx_types
+  type = scheme
+  language = c++
+  dependencies =
+
+[ccpp-arg-table]
+  name = cxx_types_run
+  type = scheme
+[ncol]
+  standard_name = horizontal_dimension
+  units = count
+  dimensions = ()
+  type = integer
+  intent = in
+[nlev]
+  standard_name = vertical_layer_dimension
+  units = count
+  dimensions = ()
+  type = integer
+  intent = in
+[col_start]
+  standard_name = horizontal_loop_begin
+  units = index
+  dimensions = ()
+  type = integer
+  intent = in
+[use_extra]
+  standard_name = flag_for_extra_forcing
+  units = flag
+  dimensions = ()
+  type = logical
+  intent = in
+[extra]
+  standard_name = extra_temperature_forcing
+  units = K
+  dimensions = (horizontal_dimension, vertical_layer_dimension)
+  type = real
+  kind = kind_phys
+  intent = in
+  optional = True
+[state]
+  standard_name = gpu_test_physics_state
+  units = DDT
+  dimensions = ()
+  type = gpu_state_type
+  intent = inout
+[temp]
+  standard_name = air_temperature
+  units = K
+  dimensions = (horizontal_dimension, vertical_layer_dimension)
+  type = real
+  kind = kind_phys
+  intent = inout
+[mask]
+  standard_name = cold_layer_mask
+  units = flag
+  dimensions = (horizontal_dimension, vertical_layer_dimension)
+  type = logical
+  intent = out
+[work]
+  standard_name = cxx_allocated_work_array
+  units = 1
+  dimensions = (horizontal_dimension)
+  type = real
+  kind = kind_phys
+  intent = out
+  allocatable = True
+[errmsg]
+  standard_name = ccpp_error_message
+  units = none
+  dimensions = ()
+  type = character
+  kind = len=512
+  intent = out
+[errflg]
+  standard_name = ccpp_error_code
+  units = 1
+  dimensions = ()
+  type = integer
+  intent = out

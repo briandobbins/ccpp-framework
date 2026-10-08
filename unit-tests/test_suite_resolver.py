@@ -36,6 +36,7 @@ from generator.suite_resolver import (
     resolve_suite,
     iter_phase_calls,
     validate_init_dimensions,
+    assign_run_local_ddts,
     SuiteVar,
     ResolvedArg,
     ResolvedCall,
@@ -3918,11 +3919,17 @@ class TestRegisterConstituentsSuiteCap(unittest.TestCase):
         self.assertIn('%items(0))', self.text)
 
     def test_buffer_append(self):
-        # Each scheme's returned array is appended to the per-instance slot.
-        self.assertIn(
-            '%items = [reg_consts_dynamic_constituents(inst_num)%items, scheme_consts]',
-            self.text,
-        )
+        # Each scheme's returned array is appended to the per-instance slot
+        # by moving the old entries aside and copying both sections, not by
+        # a self-referencing ``items = [items, scheme_consts]``, which NVHPC
+        # miscompiles (doc/compiler_issues.md, issue 5).
+        slot = 'reg_consts_dynamic_constituents(inst_num)%items'
+        self.assertIn('call move_alloc({}, prev)'.format(slot), self.text)
+        self.assertIn('allocate({}(size(prev) + size(scheme_consts)))'.format(slot),
+                      self.text)
+        self.assertIn('{}(1:size(prev)) = prev'.format(slot), self.text)
+        self.assertIn('{}(size(prev)+1:) = scheme_consts'.format(slot), self.text)
+        self.assertNotIn('%items = [', self.text)
 
     def test_final_tears_down_per_suite_buffer(self):
         # The per-suite dynamic-constituent buffer is owned by the
@@ -5643,6 +5650,49 @@ class TestValidateInitDimensions(unittest.TestCase):
         )
         validate_init_dimensions(sr)  # no raise
 
+    def test_init_written_dim_allocated_after_writer(self):
+        # Sized in init only: CCPP allocates it right after the writer.
+        sr = self._sr(
+            {'init': [('mydim', 'out')], 'run': [('myarr', 'out')]},
+            [('mydim', False, []), ('myarr', False, ['mydim'])],
+        )
+        validate_init_dimensions(sr)  # no raise
+        self.assertEqual(sr.suite_vars['myarr'].allocated_after, 's')
+        writer = sr.groups[0].phase_calls['init'][0]
+        self.assertEqual([v.standard_name for v in writer.deferred_suite_vars],
+                         ['myarr'])
+
+    def test_init_written_dim_strict_raises(self):
+        sr = self._sr(
+            {'init': [('mydim', 'out')], 'run': [('myarr', 'out')]},
+            [('mydim', False, []), ('myarr', False, ['mydim'])],
+        )
+        with self.assertRaisesRegex(CCPPError, 'strict-allocatable'):
+            validate_init_dimensions(sr, strict=True)
+
+    def test_init_and_run_written_dim_raises(self):
+        # The size changes again after init: no single allocation works.
+        sr = self._sr(
+            {'init': [('mydim', 'out')], 'run': [('mydim', 'inout'), ('myarr', 'out')]},
+            [('mydim', False, []), ('myarr', False, ['mydim'])],
+        )
+        with self.assertRaisesRegex(CCPPError, "'run' phase"):
+            validate_init_dimensions(sr)
+
+    def test_last_init_writer_chosen(self):
+        first = ResolvedCall(scheme_name='a', phase='init',
+                             args=[self._arg('dim1', 'out')])
+        second = ResolvedCall(scheme_name='b', phase='init',
+                              args=[self._arg('dim2', 'out')])
+        grp = types.SimpleNamespace(phase_calls={'init': [first, second]})
+        svs = {'arr': types.SimpleNamespace(standard_name='arr', allocatable=False,
+                                            dimensions=['dim1', 'dim2'])}
+        sr = types.SimpleNamespace(groups=[grp], suite_vars=svs)
+        validate_init_dimensions(sr)
+        self.assertEqual(svs['arr'].allocated_after, 'b')
+        self.assertEqual(first.deferred_suite_vars, [])
+        self.assertEqual([v.standard_name for v in second.deferred_suite_vars], ['arr'])
+
     def test_range_dimension_token_checked(self):
         sr = self._sr(
             {'timestep_init': [('mydim', 'inout')], 'run': [('myarr', 'out')]},
@@ -5716,6 +5766,91 @@ _SHADOW_SUITE = (
     '  </group>\n'
     '</suite>\n'
 )
+
+
+class TestAssignRunLocalDdts(unittest.TestCase):
+    """Derived-type suite objects written first in one group's run phase
+    get a per-call lifetime (a run-subroutine local), as capgen v0 gave
+    them.  Regression for CAM-SIMA's RRTMGP GPU test: persistent objects
+    re-initialised intent(out) left stale OpenACC mappings."""
+
+    class _Store:
+        def __init__(self, lang='fortran', space='host'):
+            self.lang, self.space = lang, space
+        def language_for(self, name):
+            return self.lang
+        def memory_space_for(self, name, phase, local_name):
+            return self.space
+
+    @staticmethod
+    def _sv(type_='ty_obj', dims=None, alloc=False):
+        return SuiteVar(standard_name='obj', local_name='obj', type_=type_,
+                        kind='', units='', dimensions=dims or [],
+                        source_scheme='s', source_phase='run', allocatable=alloc)
+
+    @staticmethod
+    def _arg(sv, intent):
+        return types.SimpleNamespace(
+            source='suite', suite_var=sv, intent=intent, transform_case=1,
+            scheme_local_name='obj', call_expr=sv.access_path)
+
+    @classmethod
+    def _sr(cls, sv, uses):
+        # uses: [(group, phase, intent), ...] in call order
+        groups = {}
+        for g, ph, intent in uses:
+            grp = groups.setdefault(g, types.SimpleNamespace(group_name=g, phase_calls={}))
+            grp.phase_calls.setdefault(ph, []).append(
+                ResolvedCall(scheme_name='s', phase=ph, args=[cls._arg(sv, intent)]))
+        return types.SimpleNamespace(groups=list(groups.values()))
+
+    def _run(self, sv, uses, store=None):
+        sr = self._sr(sv, uses)
+        chosen = assign_run_local_ddts(sr, store or self._Store(),
+                                       {'ty_obj': 'obj_mod'})
+        return sr, chosen
+
+    def _run_exprs(self, sr):
+        return [a.call_expr for g in sr.groups for ph, calls in g.phase_calls.items()
+                for c in calls for a in c.args if ph == 'run']
+
+    def test_written_first_in_run_is_per_call(self):
+        sv = self._sv()
+        sr, chosen = self._run(sv, [('g', 'init', 'inout'), ('g', 'run', 'out'),
+                                    ('g', 'run', 'in')])
+        self.assertEqual(chosen, ['obj'])
+        self.assertEqual(sv.run_local_group, 'g')
+        self.assertEqual(sv.run_local_type_module, 'obj_mod')
+        self.assertEqual(self._run_exprs(sr), ['ccpp_rl_obj', 'ccpp_rl_obj'])
+        # The init phase keeps the suite data copy.
+        init_arg = sr.groups[0].phase_calls['init'][0].args[0]
+        self.assertEqual(init_arg.call_expr, sv.access_path)
+
+    def test_read_first_in_run_stays_persistent(self):
+        sv = self._sv()
+        _, chosen = self._run(sv, [('g', 'run', 'in'), ('g', 'run', 'out')])
+        self.assertEqual(chosen, [])
+        self.assertEqual(sv.run_local_group, '')
+
+    def test_used_in_two_groups_stays_persistent(self):
+        sv = self._sv()
+        _, chosen = self._run(sv, [('a', 'run', 'out'), ('b', 'run', 'in')])
+        self.assertEqual(chosen, [])
+
+    def test_used_after_run_stays_persistent(self):
+        sv = self._sv()
+        _, chosen = self._run(sv, [('g', 'run', 'out'), ('g', 'timestep_final', 'in')])
+        self.assertEqual(chosen, [])
+
+    def test_intrinsic_array_and_allocatable_stay_persistent(self):
+        for sv in (self._sv(type_='real'), self._sv(dims=['n']), self._sv(alloc=True)):
+            _, chosen = self._run(sv, [('g', 'run', 'out')])
+            self.assertEqual(chosen, [], sv)
+
+    def test_cxx_or_device_use_stays_persistent(self):
+        for store in (self._Store(lang='c++'), self._Store(space='device')):
+            _, chosen = self._run(self._sv(), [('g', 'run', 'out')], store)
+            self.assertEqual(chosen, [])
 
 
 class TestHostControlLocalNameCollision(unittest.TestCase):

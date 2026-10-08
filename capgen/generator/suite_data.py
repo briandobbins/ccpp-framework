@@ -4,6 +4,7 @@
 
 import logging
 import os
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 from metadata.parse_tools import CCPPError, open_if_changed
@@ -362,7 +363,10 @@ def _generate_suite_data(
             # wrong (its extent may not be known until the scheme runs).  The
             # suite still OWNS the storage, so final_fields below deallocates
             # it regardless of who allocated it.
-            if suite_var.dimensions and not suite_var.allocatable:
+            # Variables sized by an init-phase scheme are allocated right
+            # after that scheme instead (validate_init_dimensions).
+            if suite_var.dimensions and not suite_var.allocatable \
+                    and not getattr(suite_var, 'allocated_after', ''):
                 dim_exprs = [
                     _dim_local_expr(d, suite_vars, host_dict)
                     for d in suite_var.dimensions
@@ -492,3 +496,74 @@ def write_suite_meta(
     with open_if_changed(out_path, logger=logger) as fh:
         fh.write('\n'.join(lines) + '\n')
     return out_path
+
+
+########################################################################
+# Allocation right after the scheme that sets the size
+########################################################################
+
+@dataclass
+class DeferredAlloc:
+    """Fortran for allocating one suite variable in a group cap, right
+    after the init-phase call that sets its size."""
+    standard_name: str
+    access: str                    # ccpp_suite_data(<inst>)%<local>
+    shape: str                     # allocation shape expression
+    uses: Dict[str, List[str]]     # module -> symbols the shape needs
+    #: (directive text, directive language) creating the device copy right
+    #: after the allocation, when GPU data movement tracks the variable.
+    device_create: Optional[tuple] = None
+
+
+def _deferred_dim_expr(dim: str, suite_vars, host_dict, inst: str,
+                       uses: Dict[str, List[str]], var_std: str) -> str:
+    """One shape entry (a standard name or a ``lo:hi`` range of them)."""
+    parts = []
+    for token in dim.split(':'):
+        token = token.strip()
+        if token == 'ccpp_constant_one':
+            parts.append('1')
+            continue
+        expr = _dim_local_expr(token, suite_vars, host_dict)
+        if token in suite_vars:
+            expr = expr.replace('ccpp_suite_data(i)', 'ccpp_suite_data' + inst, 1)
+        elif token == _CONST_NUM_STD:
+            expr = expr.replace('(i)%', inst + '%', 1)
+            uses.setdefault(_CONST_OBJ_MODULE, [])
+            if _CONST_OBJ_VAR not in uses[_CONST_OBJ_MODULE]:
+                uses[_CONST_OBJ_MODULE].append(_CONST_OBJ_VAR)
+        else:
+            entry = host_dict.get(token)
+            if entry.is_control:
+                raise CCPPError(
+                    "Suite-owned variable '{}' dimension '{}' is a control "
+                    "variable; suite data must use host-module or "
+                    "suite-owned dimensions".format(var_std, token))
+            mod = entry.module_name
+            uses.setdefault(mod, [])
+            if entry.local_name not in uses[mod]:
+                uses[mod].append(entry.local_name)
+        parts.append(expr)
+    return ':'.join(parts)
+
+
+def prepare_deferred_allocations(suite_res, host_dict) -> None:
+    """Build the Fortran for every allocation validate_init_dimensions
+    scheduled after an init-phase call (``ResolvedCall.deferred_allocs``)."""
+    from generator.suite_resolver import iter_phase_calls
+    suite_vars = suite_res.suite_vars
+    for group in suite_res.groups:
+        for items in group.phase_calls.values():
+            for call in iter_phase_calls(items):
+                pending = getattr(call, 'deferred_suite_vars', None) or []
+                allocs = []
+                for sv in pending:
+                    uses: Dict[str, List[str]] = {sv.module_name: ['ccpp_suite_data']}
+                    shape = ', '.join(
+                        _deferred_dim_expr(d, suite_vars, host_dict,
+                                           sv.inst_access, uses,
+                                           sv.standard_name)
+                        for d in sv.dimensions)
+                    allocs.append(DeferredAlloc(sv.standard_name,
+                                                sv.access_path, shape, uses))
+                call.deferred_allocs = allocs

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<suite name="gpu_residency_suite" version="2.0">
+  <group name="before">
+    <subcycle loop="2">
+      <scheme>gpu_heat</scheme>
+      <scheme>cpu_adjust</scheme>
+    </subcycle>
+    <scheme>gpu_moist</scheme>
+  </group>
+  <group name="after">
+    <scheme>gpu_finish</scheme>
+    <scheme>cpu_check</scheme>
+  </group>
+</suite>

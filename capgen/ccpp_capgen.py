@@ -92,14 +92,19 @@ from generator.kinds_writer import write_ccpp_kinds
 from generator.suite_xml import parse_suite_xml_files
 from generator.suite_resolver import (
     resolve_suite, iter_phase_calls, validate_init_dimensions,
+    assign_run_local_ddts,
 )
 from generator.group_cap import write_group_cap
-from generator.suite_data import write_suite_data, write_suite_meta
+from generator.suite_data import (write_suite_data, write_suite_meta,
+                                  prepare_deferred_allocations)
+from generator.device_emit import spelling as device_spelling
 from generator.suite_cap import write_suite_cap
 from generator.suite_types import write_suite_types
 from generator.host_cap import write_host_cap
 from generator.host_constituents import write_host_constituents
 from generator.datatable import write_datatable
+from generator.device_residency import DeviceOptions, plan_suite_residency
+from generator import cxx_schemes
 
 
 ########################################################################
@@ -327,6 +332,86 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "hand-edit ``logical, parameter :: trace`` in any "
             "generated cap to ``.true.`` to enable tracing for that "
             "module and rebuild."
+        ),
+    )
+    # ---- GPU data movement (doc/gpu_data_movement_plan.md) -----------------
+    parser.add_argument(
+        '--directive',
+        choices=['acc', 'omp'],
+        default=None,
+        help=(
+            "Generate GPU data-movement directives of this kind (``acc`` = "
+            "OpenACC, ``omp`` = OpenMP target) from ``memory_space`` / "
+            "``host_access`` metadata.  "
+            "Without this flag those attributes are validated but ignored "
+            "and the generated code is unchanged."
+        ),
+    )
+    parser.add_argument(
+        '--memory-model',
+        choices=['discrete', 'unified'],
+        default='discrete',
+        help=(
+            "Target memory model for --directive.  ``discrete`` (default): "
+            "separate host and device memories; device copies are created "
+            "once and kept coherent with update directives.  ``unified``: "
+            "hardware-coherent memory (GH200 / MI300A class); no copies "
+            "are made, only waits where CPU code reads GPU results."
+        ),
+    )
+    parser.add_argument(
+        '--device-trace',
+        action='store_true',
+        help=(
+            "With --directive: print to error_unit, before every device-side "
+            "scheme call, whether each device-side array has a device copy "
+            "and the shape and bounds of what is passed, and announce every "
+            "generated update with its shape.  For investigating presence "
+            "and size crashes."
+        ),
+    )
+    parser.add_argument(
+        '--strict-allocatable',
+        action='store_true',
+        help=(
+            "Require every suite variable whose size is set by a scheme "
+            "(after the register phase) to be declared allocatable and "
+            "allocated by that scheme.  Default: CCPP allocates a variable "
+            "sized in the init phase itself, right after the scheme that "
+            "sets its size; sizes set in later phases always require "
+            "allocatable."
+        ),
+    )
+    parser.add_argument(
+        '--timer-style',
+        choices=('cesm', 'fms'),
+        default=None,
+        help=(
+            "Time every scheme call in the group caps, and (with "
+            "--directive) the generated copies to and from the device, "
+            "separately, using the host's timing library: 'cesm' = GPTL "
+            "via perf_mod t_startf/t_stopf; 'fms' = FMS mpp_clock (UFS).  "
+            "Timers: <scheme>_<phase> (compute), <scheme>_<phase>_h2d and "
+            "_d2h (data movement).  Default: no timers."
+        ),
+    )
+    parser.add_argument(
+        '--device-sync-debug',
+        action='store_true',
+        help=(
+            "With --directive: copy every device-side result back to the "
+            "host right after the call that produced it, so host memory "
+            "mirrors the device for host-side debuggers and "
+            "memory-comparison tools.  Slow; debugging only."
+        ),
+    )
+    parser.add_argument(
+        '--device-debug',
+        action='store_true',
+        help=(
+            "With --directive: emit runtime presence checks before every "
+            "device-side scheme call and host/device coherence checks "
+            "wherever both copies are supposed to agree."
         ),
     )
     return parser
@@ -875,6 +960,13 @@ def capgen(
     no_host_introspection: bool = False,
     trace: bool = False,
     return_state: bool = False,
+    directive: Optional[str] = None,
+    memory_model: str = 'discrete',
+    device_debug: bool = False,
+    device_trace: bool = False,
+    device_sync_debug: bool = False,
+    timer_style: Optional[str] = None,
+    strict_allocatable: bool = False,
 ):
     """Programmatic entry point for the cap generator.
 
@@ -901,6 +993,16 @@ def capgen(
         when missing.
     logger : logging.Logger, optional
         Logger to use.  Defaults to the module-level logger.
+    directive : str, optional
+        ``'acc'`` (OpenACC) or ``'omp'`` (OpenMP target) to generate GPU
+        data-movement directives; ``None``
+        (default) leaves the generated code unchanged.
+    memory_model : str
+        ``'discrete'`` (default) or ``'unified'``; only used with
+        *directive*.
+    device_debug : bool
+        Emit runtime presence/coherence checks; only used with
+        *directive*.
 
     Raises
     ------
@@ -957,6 +1059,7 @@ def capgen(
     all_ddt_tables = ddt_from_host + ddt_from_schemes
 
     host_dict = build_flat_host_dict(host_only, control_only, all_ddt_tables)
+    ddt_index = {t.table_name: t for t in all_ddt_tables}
     log.info("Host dictionary contains %d variables", len(host_dict))
 
     # Map DDT type name → defining Fortran module, derived from co-located
@@ -1000,23 +1103,85 @@ def capgen(
     # ---- resolve and generate per-suite outputs ----------------------------
     suite_names       = []
     suite_resolutions = []
+    cxx_schemes_used: set = set()
 
     for suite in suites:
         log.info("Resolving suite '%s'", suite.name)
         suite_res = resolve_suite(suite, scheme_store, host_dict)
-        # Fail early (before any cap is written) if a non-allocatable
-        # suite-owned variable is dimensioned by a scheme-updated quantity
-        # that isn't known when suite_data_init_fields allocates it.
-        validate_init_dimensions(suite_res)
+        # Suite-owned variables sized by a scheme: CCPP allocates those
+        # sized in the init phase right after the scheme that sets the
+        # size; others (or all, with --strict-allocatable) must be declared
+        # allocatable.  Fails early, before any cap is written.
+        validate_init_dimensions(suite_res, strict=strict_allocatable)
+        prepare_deferred_allocations(suite_res, host_dict)
+        run_locals = assign_run_local_ddts(suite_res, scheme_store, ddt_module_map)
+        if run_locals:
+            log.info("Suite '%s': per-call lifetime in the run phase for %s",
+                     suite.name, ', '.join(run_locals))
+        if directive:
+            # C++ schemes: array members reached through derived-type
+            # descriptors are planned like ordinary arguments.
+            cxx_schemes.attach_member_args(suite_res, scheme_store,
+                                           kind_types, ddt_index, host_dict)
+            suite_res.device_plan = plan_suite_residency(
+                suite_res, scheme_store, host_dict,
+                DeviceOptions(directive=directive,
+                              memory_model=memory_model,
+                              debug=device_debug,
+                              trace=device_trace,
+                              sync_debug=device_sync_debug),
+                logger=log,
+            )
+            # Device copies of variables CCPP allocates after an init-phase
+            # scheme are created right after that allocation.
+            if memory_model != 'unified':
+                for group in suite_res.groups:
+                    for items in group.phase_calls.values():
+                        for call in iter_phase_calls(items):
+                            for da in call.deferred_allocs:
+                                if da.access in suite_res.device_plan.arrays:
+                                    da.device_create = (
+                                        device_spelling(directive).create(da.access),
+                                        directive)
         suite_names.append(suite.name)
         suite_resolutions.append(suite_res)
 
+        # C++ schemes may not be suite-level <init>/<final> hooks.
+        for hook in (suite_res.suite_init_call, suite_res.suite_final_call):
+            if hook is not None and scheme_store.language_for(hook.scheme_name) == 'c++':
+                raise CCPPError(
+                    "C++ scheme '{}' cannot be a suite-level <init>/<final> "
+                    "scheme".format(hook.scheme_name))
+
         # Group caps
         for resolved_group in suite_res.groups:
+            cxx_calls = cxx_schemes.group_phase_calls(resolved_group, scheme_store)
+            cxx_schemes_used.update(cxx_calls)
+            # Device allocation callbacks only with discrete GPU memory.
+            cxx_directive = (directive if directive and memory_model != 'unified'
+                             else None)
+            if cxx_calls:
+                cxx_schemes.attach_call_wraps(resolved_group, scheme_store,
+                                              kind_types, ddt_index,
+                                              directive=cxx_directive)
             write_group_cap(
                 suite.name, resolved_group.group_name, resolved_group, host_dict, output_root,
                 logger=log,
                 trace=trace,
+                device_plan=suite_res.device_plan,
+                cxx_interfaces=(cxx_schemes.interface_lines(
+                    cxx_calls, scheme_store, kind_types, ddt_index=ddt_index)
+                    if cxx_calls else None),
+                timer_style=timer_style,
+                cxx_uses=(cxx_schemes.module_use_lines(
+                    cxx_calls, scheme_store, kind_types, ddt_index)
+                    if cxx_calls else None),
+                cxx_helpers=(cxx_schemes.helper_lines(
+                    cxx_calls, scheme_store, kind_types, ddt_index,
+                    module_name='ccpp_{}_{}_cap'.format(
+                        suite.name, resolved_group.group_name),
+                    directive=cxx_directive)
+                    if cxx_calls else None),
             )
 
         # Suite data module
@@ -1042,6 +1207,12 @@ def capgen(
             logger=log,
             trace=trace,
         )
+
+    # ---- C prototypes for C++ schemes ---------------------------------------
+    if cxx_schemes_used:
+        cxx_schemes.write_headers(scheme_store, sorted(cxx_schemes_used),
+                                  kind_types, output_root, logger=log,
+                                  ddt_index=ddt_index)
 
     # ---- host cap (one file for all suites) --------------------------------
     write_host_cap(
@@ -1154,7 +1325,10 @@ def capgen(
             os.path.abspath(tbl.file_path)
         )
         resolved = None
-        for ext in ('.F90', '.f90', '.F', '.f'):
+        exts = ('.F90', '.f90', '.F', '.f')
+        if getattr(tbl, 'language', 'fortran') == 'c++':
+            exts = ('.cpp', '.cc', '.cxx', '.C', '.c')
+        for ext in exts:
             candidate = os.path.join(search_dir, meta_base + ext)
             if os.path.isfile(candidate):
                 resolved = candidate
@@ -1163,12 +1337,12 @@ def capgen(
             # Fall back to the canonical .F90 guess so the build-system
             # query returns a useful (if missing) path; surface the gap
             # at the same time so the user can fix source_path.
-            resolved = os.path.join(search_dir, meta_base + '.F90')
+            resolved = os.path.join(search_dir, meta_base + exts[0])
             log.warning(
-                "Scheme '%s': no Fortran source found under '%s' for "
-                "any of .F90/.f90/.F/.f; using '%s' as the datatable "
-                "entry.  Check the scheme's source_path table-property.",
-                tbl.table_name, search_dir, resolved,
+                "Scheme '%s': no source found under '%s' for any of %s; "
+                "using '%s' as the datatable entry.  Check the scheme's "
+                "source_path table-property.",
+                tbl.table_name, search_dir, '/'.join(exts), resolved,
             )
         if resolved not in _seen_scheme_files:
             _seen_scheme_files.add(resolved)
@@ -1261,6 +1435,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             kind_types=kind_types,
             no_host_introspection=args.no_host_introspection,
             trace=args.trace,
+            directive=args.directive,
+            memory_model=args.memory_model,
+            device_debug=args.device_debug,
+            device_trace=args.device_trace,
+            device_sync_debug=args.device_sync_debug,
+            timer_style=args.timer_style,
+            strict_allocatable=args.strict_allocatable,
         )
     except CCPPError as exc:
         _LOGGER.error("%s", exc)

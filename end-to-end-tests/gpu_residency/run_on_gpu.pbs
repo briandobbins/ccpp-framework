@@ -1,0 +1,46 @@
+#!/bin/bash -l
+#PBS -N ccpp_gpu_residency
+#PBS -q develop
+#PBS -l select=1:ncpus=4:ngpus=1:mem=20GB
+#PBS -l walltime=00:10:00
+#PBS -j oe
+#
+# Run built variants of the GPU data-movement test on one GPU and compare
+# each with the CPU reference build (MODE=off).  Submit with, e.g.
+#
+#   qsub -A <account> -v BUILD_ROOT=/path/to/builds,BUILDS="gpu gpu-debug" run_on_gpu.pbs
+#
+# where each name in BUILDS is a directory under BUILD_ROOT made by
+# build.sh, and BUILD_ROOT/off holds the CPU reference.  NOTIFY=3 makes the
+# NVHPC runtime log every kernel launch and transfer to run.log.  EXE and
+# OUT name the test executable and its output file (defaults: the
+# gpu_residency test's).
+#
+# The #PBS lines are Derecho's: its develop queue routes GPU requests to the
+# gpudev nodes and usually starts within seconds (direct submission to
+# gpu/gpudev is denied).  On another PBS system change the queue and the
+# select line.  Elsewhere, run it directly on a node with a GPU (the #PBS
+# lines are then plain comments), e.g. inside a Slurm allocation:
+#
+#   BUILD_ROOT=$B BUILDS="gpu omp" bash run_on_gpu.pbs
+#
+# The line below loads NVHPC's runtime on Derecho; it does nothing where
+# that module command or those modules do not exist.  Elsewhere, have
+# NVHPC's libraries on LD_LIBRARY_PATH before running.
+command -v module >/dev/null 2>&1 && module swap intel nvhpc >/dev/null 2>&1
+nvidia-smi -L
+for b in $BUILDS; do
+  echo "=== $b"
+  cd "$BUILD_ROOT/$b" || continue
+  EXE=${EXE:-test_gpu_residency.x}; OUT=${OUT:-gpu_residency_out.txt}
+  rm -f $OUT
+  NV_ACC_NOTIFY=${NOTIFY:-0} ./$EXE > run.log 2>&1; rc=$?
+  echo "exit=$rc"; tail -3 run.log
+  if [ -f $OUT ]; then
+    if cmp -s $OUT "$BUILD_ROOT/off/$OUT"; then
+      echo "MATCHES CPU REFERENCE (bit for bit)"
+    else
+      echo "DIFFERS FROM CPU REFERENCE"
+    fi
+  fi
+done

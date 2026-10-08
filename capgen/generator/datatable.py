@@ -396,6 +396,55 @@ def _build_var_dictionaries(
                             v.set('local_name', arg.scheme_local_name)
 
 
+def _build_device_residency(root: ET.Element, suite_resolutions) -> None:
+    """GPU data movement: record each suite's residency plan.
+
+    Written only when some suite has a plan (``--directive`` given), so the
+    datatable is unchanged otherwise.  Lists every tracked array, where its
+    valid copy lives while the host has control (the handoff state), every
+    scheme access to it, and per group phase how many data-movement
+    statements were generated.  See doc/gpu_data_movement_plan.md.
+    """
+    from generator.device_residency import SuitePlan, H, D
+    plans = [r.device_plan for r in suite_resolutions
+             if isinstance(getattr(r, 'device_plan', None), SuitePlan)]
+    if not plans:
+        return
+    top = ET.SubElement(root, 'device_residency')
+    top.set('directive', plans[0].options.directive)
+    top.set('memory_model', plans[0].options.memory_model)
+    handoff_names = {frozenset({H}): 'host', frozenset({D}): 'device',
+                     frozenset({H, D}): 'host_and_device'}
+    for plan in plans:
+        s_elem = ET.SubElement(top, 'suite')
+        s_elem.set('name', plan.suite_name)
+        for arr in plan.arrays.values():
+            a = ET.SubElement(s_elem, 'array')
+            a.set('name', arr.base_expr)
+            a.set('standard_names', ','.join(sorted(arr.standard_names)))
+            a.set('owner', arr.owner)
+            a.set('handoff', handoff_names.get(arr.handoff, ''))
+            if arr.host_access:
+                a.set('host_access', arr.host_access)
+            for group, phase, scheme, intent, space in arr.uses:
+                u = ET.SubElement(a, 'access')
+                u.set('group', group)
+                u.set('phase', phase)
+                u.set('scheme', scheme)
+                u.set('intent', intent)
+                u.set('memory_space', space)
+        for (group, phase), pp in sorted(plan.phases.items()):
+            counts = {'device': 0, 'self': 0, 'wait': 0}
+            for up in pp.all_updates():
+                counts[up.kind] = counts.get(up.kind, 0) + 1
+            p_elem = ET.SubElement(s_elem, 'phase')
+            p_elem.set('group', group)
+            p_elem.set('phase', phase)
+            p_elem.set('updates_to_device', str(counts['device']))
+            p_elem.set('updates_to_host', str(counts['self']))
+            p_elem.set('waits', str(counts['wait']))
+
+
 def write_datatable(
     suite_resolutions: List[SuiteResolution],
     scheme_store,
@@ -483,6 +532,7 @@ def write_datatable(
     _build_schemes(root, suite_resolutions, scheme_store)
     _build_api(root, suite_resolutions)
     _build_var_dictionaries(root, host_dict, host_name, suite_resolutions)
+    _build_device_residency(root, suite_resolutions)
 
     deps_elem = ET.SubElement(root, 'dependencies')
     for dep in sorted(set(dependency_paths or [])):

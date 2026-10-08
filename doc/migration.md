@@ -255,15 +255,41 @@ declared `number_of_vertical_interfaces_in_RRTMGP` must be sized with
 that value, **not** the host's `vertical_interface_dimension` nor
 `nlay+1`, which differ when the scheme runs on a reduced vertical grid.)
 
-**Generation-time guard.**  capgen rejects a *non*-`allocatable`
-suite-owned array whose dimension is written by a scheme in any phase
-after `register` — it would otherwise be allocated from uninitialized
-memory.  The error names the variable, the offending dimension, and the
-fix (declare it `allocatable`).  The check is sound but partial: it sees
-only dimensions a *scheme* writes, not a host scalar the host driver
-re-computes each step — those remain the author's responsibility, and
-the rule "anything the scheme allocates must be `allocatable` in Fortran
-and metadata" is ultimately enforced by the compiler plus `ccpp_validator`.
+**Generation-time guard, and CCPP allocation after the sizing scheme.**
+A non-`allocatable` suite-owned array whose dimension is written by a
+scheme after `register` cannot be allocated in `suite_data_init_fields`.
+If the dimension is written only in the `init` phase, capgen allocates the
+array itself, once, right after the last init-phase scheme that writes the
+dimension (the group cap emits the `allocate`).  If it is written in a later
+phase (`timestep_init`, `run`, `final`), capgen rejects it: declare it
+`allocatable` so the producing scheme allocates it.  With
+`--strict-allocatable` capgen rejects every such array (the previous rule:
+the scheme always allocates).  Which behaviour is the default is an open
+question, FU-050.  The check sees only dimensions a *scheme* writes, not a
+host scalar the host driver re-computes each step -- those remain the
+author's responsibility, and the rule "anything the scheme allocates must be
+`allocatable` in Fortran and metadata" is ultimately enforced by the compiler
+plus `ccpp_validator`.
+
+**Per-call derived-type objects.**  One exception to "stored for the whole
+run": a suite-owned **derived-type scalar** (not allocatable, not an
+array) gets a fresh object on every call of a group's run phase when
+
+- every run-phase use is in that one group, and the first is
+  `intent(out)` (no value carries into or between run calls);
+- it is used in no phase other than `register`, `init` and `run` (those
+  earlier phases keep using the `ccpp_<suite>_data` copy);
+- no use is by a C++ scheme or through a device-side argument.
+
+The group cap declares it as a local of `<group>_run`, named
+`ccpp_rl_<local_name>`.  This is the lifetime capgen v0 gave such
+objects, and physics relies on it.  CAM-SIMA's RRTMGP re-initialises its
+gas-concentration and optical-property objects `intent(out)` each step;
+on one persistent object, the components Fortran frees on entry keep
+stale OpenACC device mappings and the GPU run aborts ("partially present
+on the device").  The rule lives in
+`generator/suite_resolver.py:assign_run_local_ddts`.  Arrays keep the
+allocate-once lifetime.
 
 ### 1.4 Sliced local names with long subscript indices
 

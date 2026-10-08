@@ -124,6 +124,32 @@ VALID_SCHEME_PHASES = frozenset({
 #: Valid intent values for scheme variables.
 VALID_INTENTS = frozenset({'in', 'out', 'inout'})
 
+#: Valid ``memory_space`` values (scheme args, scheme arg-table headers,
+#: host and ddt variables).  See doc/gpu_data_movement_plan.md.
+VALID_MEMORY_SPACES = frozenset({'host', 'device'})
+
+#: Valid ``language`` values (``[ccpp-table-properties]`` of scheme tables).
+VALID_LANGUAGES = frozenset({'fortran', 'c++'})
+
+#: Valid ``host_access`` values (host and ddt variables only).
+VALID_HOST_ACCESS = frozenset({'read_write', 'read', 'none'})
+
+
+def check_memory_space(value: str) -> str:
+    """Return the normalised ``memory_space`` *value* or raise CCPPError.
+
+    >>> check_memory_space(' Device ')
+    'device'
+    """
+    mv = value.strip().lower()
+    if mv not in VALID_MEMORY_SPACES:
+        raise CCPPError(
+            "Invalid memory_space '{}'; must be one of {}".format(
+                value, sorted(VALID_MEMORY_SPACES),
+            )
+        )
+    return mv
+
 #: Maximum allowed length for a Fortran identifier (F2018 §6.1.1).
 FORTRAN_MAX_IDENT_LEN = 63
 
@@ -495,6 +521,8 @@ class MetaVar:
         'diagnostic_name', 'diagnostic_name_fixed',
         'constituent', 'advected', 'molar_mass',
         'top_at_one',
+        # GPU data movement (see doc/gpu_data_movement_plan.md).
+        'memory_space', 'host_access',
     })
 
     # auto-clone-constituents: the legacy auto-clone shim extends the
@@ -574,6 +602,18 @@ class MetaVar:
         # substitutes the vertical index with ``<vdim_local> - k + 1`` on the
         # host-side access expression.
         self.top_at_one: bool    = False
+        # GPU data movement.  ``memory_space`` says where the code that
+        # touches this variable runs: in GPU kernels (``device``) or on
+        # the CPU (``host``).  On a scheme argument it describes that
+        # scheme's access; on a host variable ``device`` means the host
+        # itself allocates and maintains the device copy.  ``host_access``
+        # (host/ddt variables only) is the host's promise about what its
+        # own code does with the variable between CCPP calls:
+        # ``read_write`` (default), ``read`` or ``none``.  Empty string
+        # means "not set"; defaults are applied by the consumers so an
+        # explicit value can be told apart from an inherited one.
+        self.memory_space: str   = ''
+        self.host_access: str    = ''
         # auto-clone-constituents: legacy attrs accepted only when the
         # shim is enabled.  Backing fields use ``None`` as the
         # "not set" sentinel so the emitter can distinguish an
@@ -684,6 +724,17 @@ class MetaVar:
                 self.molar_mass = check_molar_mass(value.strip(), None, error=True)
             elif key == 'top_at_one':
                 self.top_at_one = _parse_bool(value, context)
+            elif key == 'memory_space':
+                self.memory_space = check_memory_space(value)
+            elif key == 'host_access':
+                hv = value.strip().lower()
+                if hv not in VALID_HOST_ACCESS:
+                    raise CCPPError(
+                        "Invalid host_access '{}'; must be one of {}".format(
+                            value, sorted(VALID_HOST_ACCESS),
+                        )
+                    )
+                self.host_access = hv
             # auto-clone-constituents: BEGIN legacy-shim attr setters.
             # Only reachable when ``_known_attrs()`` returned the
             # union, so the strict-mode unknown-attr error fires
@@ -887,6 +938,40 @@ class MetadataSection:
         self._phase: Optional[str] = None
         if section_type == SCHEME_TABLE_TYPE:
             self._phase = self._extract_phase(section_name, table_name, context)
+        # Default ``memory_space`` for every argument of this scheme phase
+        # (``[ccpp-arg-table]`` header key).  Empty string = not set.
+        self.memory_space: str = ''
+        self._props_applied: bool = False
+
+    def apply_section_props(self, props: dict, context: ParseContext) -> None:
+        """Apply optional ``[ccpp-arg-table]`` header keys.
+
+        Only ``memory_space`` is recognised beyond ``name``/``type``, and
+        only on scheme sections.  Other keys keep their historical
+        behaviour (ignored).  Idempotent.
+        """
+        if self._props_applied:
+            return
+        self._props_applied = True
+        if 'memory_space' in props:
+            if self.section_type != SCHEME_TABLE_TYPE:
+                raise CCPPError(
+                    "'memory_space' in a [ccpp-arg-table] header is only "
+                    "valid for scheme tables (section '{}' is type '{}'), "
+                    "at {}".format(self.section_name, self.section_type,
+                                   context)
+                )
+            try:
+                self.memory_space = check_memory_space(props['memory_space'])
+            except CCPPError as exc:
+                raise CCPPError("{} in section '{}', at {}".format(
+                    exc, self.section_name, context)) from exc
+
+    def effective_memory_space(self, var: 'MetaVar') -> str:
+        """Return *var*'s memory space for this phase: its own
+        ``memory_space`` if set, else this section's default, else
+        ``'host'``."""
+        return var.memory_space or self.memory_space or 'host'
 
     @staticmethod
     def _extract_phase(section_name: str, scheme_name: str,
@@ -1006,6 +1091,10 @@ class MetadataTable:
         # Each entry is ``(kind_name, module, spec)``; aggregated by
         # ccpp_capgen into the kind map for ccpp_kinds.F90.
         self.kind_specs: List[Tuple[str, str, str]] = []
+        # Implementation language of a scheme table: 'fortran' (default)
+        # or 'c++' (called through a BIND(C) interface block; see
+        # generator/cxx_schemes.py).
+        self.language: str = 'fortran'
 
     def apply_table_props(self, props: dict) -> None:
         """Apply extra ``[ccpp-table-properties]`` key-value pairs to this table.
@@ -1105,6 +1194,21 @@ class MetadataTable:
             raw = props['module_name'].strip()
             if raw:
                 self.module_name = raw
+
+        if 'language' in props:
+            lang = props['language'].strip().lower()
+            if lang not in VALID_LANGUAGES:
+                raise CCPPError(
+                    "Invalid language '{}' for table '{}'; must be one of {}, "
+                    "at {}".format(props['language'], self.table_name,
+                                   sorted(VALID_LANGUAGES), self.context))
+            if lang != 'fortran' and self.table_type != SCHEME_TABLE_TYPE:
+                raise CCPPError(
+                    "language = {} is only supported on scheme tables (a "
+                    "Fortran host calling C++ schemes); table '{}' is type "
+                    "'{}', at {}".format(lang, self.table_name,
+                                         self.table_type, self.context))
+            self.language = lang
 
     @property
     def is_scheme(self) -> bool:
@@ -1295,6 +1399,11 @@ def _parse_lines(lines: List[str], file_path: str) -> List[MetadataTable]:
         nonlocal current_section
         if current_section is None:
             return
+        if collecting_section_props:
+            # A section with no variables: its header keys were never
+            # applied at a variable header.
+            current_section.apply_section_props(pending_props,
+                                                ctx(pending_start))
         flush_var(lineno)
         if current_table is None:
             raise CCPPError(
@@ -1361,6 +1470,9 @@ def _parse_lines(lines: List[str], file_path: str) -> List[MetadataTable]:
         # ---- Variable header  [ name ] ----------------------------------------
         var_match = _VAR_HEADER_RE.match(line)
         if var_match:
+            if collecting_section_props and current_section is not None:
+                current_section.apply_section_props(pending_props,
+                                                    ctx(pending_start))
             collecting_table_props = False
             collecting_section_props = False
             # Flush the previous variable.
@@ -1441,6 +1553,23 @@ def _parse_lines(lines: List[str], file_path: str) -> List[MetadataTable]:
                             "'{}' is a scheme-only attribute and cannot "
                             "appear in host, control, ddt, or suite "
                             "metadata".format(key),
+                            token=key, context=ctx(lineno)
+                        )
+                    if (sec_type not in ('host', 'ddt')
+                            and key == 'host_access'):
+                        raise ParseSyntaxError(
+                            "'host_access' describes what host-model code "
+                            "does with a variable between CCPP calls and "
+                            "may only appear in host or ddt metadata; not "
+                            "valid for {} tables".format(sec_type),
+                            token=key, context=ctx(lineno)
+                        )
+                    if (sec_type not in (SCHEME_TABLE_TYPE, 'host', 'ddt')
+                            and key == 'memory_space'):
+                        raise ParseSyntaxError(
+                            "'memory_space' may only appear in scheme, host "
+                            "or ddt metadata; not valid for {} tables".format(
+                                sec_type),
                             token=key, context=ctx(lineno)
                         )
                     if (sec_type != SCHEME_TABLE_TYPE and

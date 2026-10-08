@@ -25,6 +25,7 @@ from typing import Dict, List, Optional, Set
 
 from metadata.parse_tools import open_if_changed
 from metadata.variable_resolver import HostVarEntry, SchemeStore
+from generator import device_emit
 from generator.suite_resolver import (
     ResolvedArg,
     ResolvedGroup,
@@ -551,21 +552,30 @@ def _register_lines(
 
         # Single pass: call each constituent scheme's _register EXACTLY ONCE
         # and append its returned array to this instance's slot.  Start from
-        # an empty slot and grow it; intrinsic assignment of the constituent
-        # array constructor deep-copies each entry (same assignment the old
-        # copy loop used element-wise).
+        # an empty slot and grow it by moving the old entries aside and
+        # copying both sections.  Not ``items = [items, scheme_consts]``:
+        # NVHPC 25.9 and 26.1 corrupt the deferred-length character
+        # components of the old entries in that self-referencing
+        # reallocating assignment (doc/compiler_issues.md, issue 5).
         lines.append(
             "{}! Pack each scheme's constituents (register run once each).".format(i2)
         )
         lines.append('{}allocate({}({})%items(0))'.format(i2, buf, inst_idx))
+        slot = '{}({})%items'.format(buf, inst_idx)
         for _gname, resolved_call in _register_calls(suite_res):
             if resolved_call.scheme_name in const_scheme_names:
                 _emit_register_call(resolved_call, i2, errflg_local, lines)
-                lines.append(
-                    '{0}{1}({2})%items = [{1}({2})%items, scheme_consts]'.format(
-                        i2, buf, inst_idx,
-                    )
-                )
+                lines.extend([
+                    '{}block'.format(i2),
+                    '{}type({}), allocatable :: prev(:)'
+                    .format(i2 + _INDENT, _CONST_PROP_TYPE),
+                    '{}call move_alloc({}, prev)'.format(i2 + _INDENT, slot),
+                    '{}allocate({}(size(prev) + size(scheme_consts)))'
+                    .format(i2 + _INDENT, slot),
+                    '{}{}(1:size(prev)) = prev'.format(i2 + _INDENT, slot),
+                    '{}{}(size(prev)+1:) = scheme_consts'.format(i2 + _INDENT, slot),
+                    '{}end block'.format(i2),
+                ])
                 lines.append('{}deallocate(scheme_consts)'.format(i2))
         # auto-clone-constituents: reserve n_auto_clone trailing slots after
         # the scheme-registered entries, then instantiate into them.
@@ -689,6 +699,10 @@ def _init_lines(
         extra_uses.setdefault(data_mod, set()).add(init_fields)
     if suite_res.suite_init_call is not None:
         _add_call_uses(extra_uses, suite_res.suite_init_call)
+    plan = suite_res.device_plan
+    if plan is not None:
+        for mod, syms in device_emit.suite_init_uses(plan).items():
+            extra_uses.setdefault(mod, set()).update(syms)
     for mod in sorted(extra_uses):
         syms = ', '.join(sorted(extra_uses[mod]))
         lines.append('{}use {}, only: {}'.format(i2, mod, syms))
@@ -757,6 +771,10 @@ def _init_lines(
             i2, init_fields, inst_idx, errmsg_local, errflg_local
         ))
         lines.append('{}if ({} /= 0) return'.format(i2, errflg_local))
+
+    # GPU data movement: one device copy per tracked array for the run.
+    if plan is not None:
+        lines.extend(device_emit.suite_init_lines(plan, i2))
 
     # Constituent state binding is owned by the host_constituents module
     # under option A — the host calls ccpp_initialize_constituents separately
@@ -849,6 +867,10 @@ def _final_lines(
     # in the scheme module and any host modules its args reference.
     if suite_res.suite_final_call is not None:
         _add_call_uses(final_uses, suite_res.suite_final_call)
+    plan = suite_res.device_plan
+    if plan is not None:
+        for mod, syms in device_emit.suite_init_uses(plan).items():
+            final_uses.setdefault(mod, set()).update(syms)
 
     for mod in sorted(final_uses):
         syms = ', '.join(sorted(final_uses[mod]))
@@ -888,6 +910,17 @@ def _final_lines(
         ),
         '',
     ]
+
+    # GPU data movement: delete the device copies made in <suite>_init.
+    if plan is not None:
+        del_lines = device_emit.suite_final_lines(plan, i2 + '  ')
+        if del_lines:
+            lines.append(
+                '{}if (ccpp_suite_state({}) == CCPP_SUITE_FRAMEWORK_INITIALIZED) then'.format(
+                    i2, inst_idx))
+            lines.extend(del_lines)
+            lines.append('{}end if'.format(i2))
+            lines.append('')
 
     # Deallocate inner suite-data fields if this instance was past REGISTERED.
     if suite_res.suite_vars:
@@ -1288,6 +1321,9 @@ def _generate_suite_cap(
     pub_subs.append('{}_final'.format(suite_name))
     pub_subs.append('{}_suite_state_alloc'.format(suite_name))
     pub_subs.append('{}_suite_state_dealloc'.format(suite_name))
+    if suite_res.device_plan is not None:
+        for direction in device_emit.SYNC_DIRECTIONS:
+            pub_subs.append(device_emit.suite_sync_sub_name(suite_name, direction))
 
     for sub in pub_subs:
         lines.append('{}public :: {}'.format(_INDENT, sub))
@@ -1311,6 +1347,14 @@ def _generate_suite_cap(
     has_suite_vars = bool(suite_res.suite_vars)
     lines.extend(_suite_state_alloc_lines(suite_name, has_suite_vars))
     lines.extend(_suite_state_dealloc_lines(suite_name, has_suite_vars))
+    if device_emit.suite_needs_omp_present_helper(suite_res.device_plan):
+        lines.extend(device_emit.OMP_PRESENT_HELPER)
+    if suite_res.device_plan is not None:
+        lines.extend(device_emit.suite_sync_subroutines(
+            suite_res.device_plan,
+            _ctrl_local(host_dict, 'ccpp_error_message') or 'errmsg',
+            _ctrl_local(host_dict, 'ccpp_error_code') or 'errflg',
+            _INDENT, _INDENT * 2))
 
     lines.append('')
     lines.append('end module {}'.format(mod_name))

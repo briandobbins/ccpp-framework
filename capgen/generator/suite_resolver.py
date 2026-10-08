@@ -61,7 +61,7 @@ Case    optional?         transform?
 import hashlib
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from metadata.parse_tools import CCPPError, FORTRAN_CONDITIONAL_REGEX
 from metadata.registered_dimensions import (
@@ -1059,6 +1059,21 @@ class SuiteVar:
     suite_module_name: str = ''
     inst_access: str = '(1)'
     allocatable: bool = False
+    # Set by validate_init_dimensions when CCPP allocates this variable
+    # right after the init-phase scheme that sets its size (the scheme's
+    # name), instead of in suite_data_init_fields.
+    allocated_after: str = ''
+    # Set by assign_run_local_ddts when this derived-type object lives for
+    # one call of a group's run phase (a local of that group's run
+    # subroutine) rather than in the suite data module.  ``run_local_type_
+    # module`` is the module that defines the type.
+    run_local_group: str = ''
+    run_local_type_module: str = ''
+
+    @property
+    def run_local_name(self) -> str:
+        """Name of the run-phase local that replaces this object."""
+        return 'ccpp_rl_{}'.format(self.local_name)
 
     @property
     def access_path(self) -> str:
@@ -1230,6 +1245,18 @@ class ResolvedCall:
     # the Fortran module name match; overridden by the ``module_name``
     # attribute in ``[ccpp-table-properties]`` when the two differ.
     scheme_module: str = ''
+    # 'fortran' (default) or 'c++' (called through a BIND(C) interface
+    # block instead of a USE; see generator/cxx_schemes.py).
+    language: str = 'fortran'
+    # C++ calls only: call-site conversions (cxx_schemes.CallWrap), set by
+    # cxx_schemes.attach_call_wraps before the group caps are written.
+    cxx_wrap: Optional[Any] = None
+    # Suite variables CCPP allocates right after this call, because this
+    # (init-phase) call sets their size (set by validate_init_dimensions),
+    # and the Fortran for each (DeferredAlloc, set by
+    # prepare_deferred_allocations).
+    deferred_suite_vars: List[Any] = field(default_factory=list)
+    deferred_allocs: List[Any] = field(default_factory=list)
 
     @property
     def used_modules(self) -> Dict[str, Set[str]]:
@@ -1345,6 +1372,81 @@ class ResolvedSubcycle:
 PhaseItem = Union[ResolvedCall, ResolvedSubcycle]
 
 
+_RUN_LOCAL_INTRINSICS = frozenset({
+    'real', 'integer', 'logical', 'character', 'complex', 'double precision',
+})
+
+
+def assign_run_local_ddts(suite_res: 'SuiteResolution', scheme_store,
+                          ddt_module_map: Optional[Dict[str, str]]) -> List[str]:
+    """Give some derived-type suite variables a per-call lifetime.
+
+    capgen v0 made a suite variable used only inside one group a local of
+    that group's subroutine, so it was created afresh on every call.
+    capgen v1 keeps every suite variable in the suite data module for the
+    whole run.  Physics can depend on the fresh object: RRTMGP's
+    ``rrtmgp_inputs`` takes its gas-concentration and optical-property
+    objects ``intent(out)``, so Fortran frees their allocatable components
+    on entry without RRTMGP's ``!$acc exit data``; with one persistent
+    object, later allocations overlap the stale device mappings and
+    OpenACC aborts ("partially present").
+
+    A suite variable gets a per-call lifetime in group G's run phase when
+    all of these hold:
+
+    * its type is a derived type whose module is known, and it is a
+      non-allocatable scalar;
+    * every run-phase use is in group G, and the first one is
+      ``intent(out)`` (so no value is carried into or between run calls);
+    * it is used in no phase other than ``register``, ``init`` and ``run``
+      (those earlier phases keep using the suite data copy);
+    * no use is by a C++ scheme or through a device-side argument (the GPU
+      data-movement planner and the C++ wrappers address the suite copy).
+
+    Only the call expressions of G's run-phase arguments change
+    (``SuiteVar.run_local_name``); the group cap declares the local.
+    Returns the standard names given a per-call lifetime, sorted.
+    """
+    uses: Dict[str, List[Tuple[str, str, Any, Any]]] = {}
+    for resolved_group in suite_res.groups:
+        for phase, items in resolved_group.phase_calls.items():
+            for resolved_call in iter_phase_calls(items):
+                for arg in resolved_call.args:
+                    if arg.source == 'suite' and arg.suite_var is not None:
+                        uses.setdefault(arg.suite_var.standard_name, []).append(
+                            (resolved_group.group_name, phase, resolved_call, arg))
+    chosen: List[str] = []
+    for std, use_list in uses.items():
+        sv = use_list[0][3].suite_var
+        t = sv.type_.strip()
+        if t.lower().startswith('type('):
+            t = t[t.index('(') + 1:t.rindex(')')].strip()
+        if (t.lower() in _RUN_LOCAL_INTRINSICS or t.lower().startswith('external:')
+                or sv.dimensions or sv.allocatable
+                or not ddt_module_map or t not in ddt_module_map):
+            continue
+        if any(ph not in ('register', 'init', 'run') for _, ph, _, _ in use_list):
+            continue
+        run_uses = [u for u in use_list if u[1] == 'run']
+        if not run_uses or len({g for g, _, _, _ in run_uses}) != 1:
+            continue
+        if (run_uses[0][3].intent or 'in') != 'out':
+            continue
+        if any(scheme_store.language_for(call.scheme_name) != 'fortran'
+               or scheme_store.memory_space_for(call.scheme_name, call.phase,
+                                                arg.scheme_local_name) == 'device'
+               for _, _, call, arg in use_list):
+            continue
+        if any(arg.transform_case != 1 for _, _, _, arg in run_uses):
+            continue
+        sv.run_local_group = run_uses[0][0]
+        sv.run_local_type_module = ddt_module_map[t]
+        for _, _, _, arg in run_uses:
+            arg.call_expr = sv.run_local_name
+        chosen.append(std)
+    return sorted(chosen)
+
+
 def iter_phase_calls(items: List[PhaseItem]):
     """Yield every :class:`ResolvedCall` in *items*, recursing into
     nested :class:`ResolvedSubcycle` items.  Subcycles themselves are
@@ -1454,6 +1556,11 @@ class SuiteResolution:
     # a ``%instantiate(...)`` call per entry into the per-suite
     # dynamic-constituents buffer.  Empty when the shim is off.
     auto_cloned_constituents: List[AutoCloneEntry] = field(default_factory=list)
+    # GPU data movement: the residency plan built by
+    # :func:`generator.device_residency.plan_suite_residency` when
+    # ``--directive`` is given; ``None`` otherwise (emitters then produce
+    # exactly the code they always have).
+    device_plan: Optional[object] = None
 
     # auto-clone-constituents: this property exists so consumer
     # emitters (host_constituents, suite_cap) never have to read
@@ -2682,66 +2789,96 @@ def resolve_suite(
     )
 
 
-def validate_init_dimensions(suite_res: SuiteResolution) -> None:
-    """Reject suite-owned vars whose suite-time allocation can't be sized.
+def validate_init_dimensions(suite_res: SuiteResolution,
+                             strict: bool = False) -> None:
+    """Decide how suite-owned variables sized by a scheme are allocated.
 
     capgen allocates every non-allocatable, dimensioned suite-owned
     variable once in ``suite_data_init_fields``, which runs at the very
     start of ``<suite>_init`` -- before any ``init`` / ``timestep_init`` /
     ``run`` scheme code.  Only the ``register`` phase completes earlier, so
     a dimension whose value is written by a scheme in any later phase is not
-    yet set when the allocation happens (the size would be uninitialised
-    memory).  Such a variable must instead be declared ``allocatable``
-    (Fortran ``allocatable, intent(out)`` + metadata ``allocatable = True``)
-    so its producing scheme allocates it once the size is known.
+    yet set when that allocation happens.
 
-    This is sound (no false positives) but intentionally partial: it sees
-    only dimensions a *scheme* writes.  A host that recomputes a host-owned
-    dimension in its own driver each step is invisible here -- there is no
-    metadata signal for it.
+    * Sizes written in the ``init`` phase (and nowhere later): CCPP
+      allocates the variable once, right after the last init-phase scheme
+      that writes one of its dimensions (``SuiteVar.allocated_after``;
+      the code is emitted by the group cap, see
+      :func:`prepare_deferred_allocations`).
+    * Sizes written in ``timestep_init``, ``run`` or ``final``: no single
+      allocation can be sized correctly, so the variable must be declared
+      ``allocatable`` (Fortran ``allocatable, intent(out)`` + metadata
+      ``allocatable = True``) and allocated by its producing scheme.
+    * ``strict`` (``--strict-allocatable``): every variable sized by a
+      scheme after ``register`` must be declared ``allocatable``; CCPP
+      never allocates it.
+
+    This sees only dimensions a *scheme* writes.  A host that recomputes a
+    host-owned dimension in its own driver each step is invisible here --
+    there is no metadata signal for it.
 
     Raises
     ------
     CCPPError
-        If a non-allocatable suite-owned variable is dimensioned by a
-        standard name written by a scheme in a phase after ``register``.
+        If a non-allocatable suite-owned variable cannot be allocated as
+        described above.
     """
-    written_after_register: Set[str] = set()
+    written: Dict[str, Set[str]] = {}
+    # standard name -> (call order, call) of its last init-phase writer
+    last_init_writer: Dict[str, Tuple[int, Any]] = {}
+    order = 0
     for resolved_group in suite_res.groups:
         for phase, items in resolved_group.phase_calls.items():
             if phase == 'register':
                 continue
             for resolved_call in iter_phase_calls(items):
+                order += 1
                 for arg in resolved_call.args:
                     if (arg.intent or 'in') in ('out', 'inout'):
-                        written_after_register.add(arg.standard_name)
-
+                        written.setdefault(arg.standard_name, set()).add(phase)
+                        if phase == 'init':
+                            last_init_writer[arg.standard_name] = (order, resolved_call)
     for suite_var in suite_res.suite_vars.values():
         if suite_var.allocatable or not suite_var.dimensions:
             continue
+        late = []
         for dim in suite_var.dimensions:
             for token in dim.split(':'):
                 token = token.strip()
-                if token in written_after_register:
-                    raise CCPPError(
-                        "Suite-owned variable '{var}' is allocated by the "
-                        "suite at init time (in suite_data_init_fields), but "
-                        "its dimension '{dim}' is written by a scheme in a "
-                        "phase after 'register', so its size is not yet known "
-                        "when the allocation runs (the allocation would use "
-                        "uninitialised memory).\n"
-                        "  Declare '{var}' allocatable -- 'allocatable, "
-                        "intent(out)' in the producing scheme's Fortran and "
-                        "'allocatable = True' in its metadata -- so the scheme "
-                        "allocates it once '{dim}' is set.".format(
-                            var=suite_var.standard_name, dim=token,
-                        )
-                    )
-
-
-# auto-clone-constituents: BEGIN legacy-shim helpers.  Delete this
-# block together with the rest of the auto-clone-constituents
-# touchpoints; nothing else in the resolver references these.
+                if token in written and token not in late:
+                    late.append(token)
+        if not late:
+            continue
+        later = sorted({ph for t in late for ph in written[t]} - {'init'})
+        if strict or later:
+            token = late[0]
+            if strict:
+                why = ("its dimension '{dim}' is written by a scheme in a "
+                       "phase after 'register', and --strict-allocatable "
+                       "requires such variables to be allocated by their "
+                       "producing scheme")
+            else:
+                why = ("its dimension '{dim}' is written by a scheme in the "
+                       "'{ph}' phase, after which no single allocation can "
+                       "be sized correctly")
+            raise CCPPError(
+                ("Suite-owned variable '{var}' cannot be allocated by CCPP: "
+                 + why + " (the allocation would use uninitialised memory "
+                 "or a stale size).\n"
+                 "  Declare '{var}' allocatable -- 'allocatable, "
+                 "intent(out)' in the producing scheme's Fortran and "
+                 "'allocatable = True' in its metadata -- so the scheme "
+                 "allocates it once '{dim}' is set.").format(
+                    var=suite_var.standard_name, dim=token,
+                    ph=later[0] if later else ''))
+        _, writer = max((last_init_writer[t] for t in late),
+                        key=lambda ow: ow[0])
+        suite_var.allocated_after = writer.scheme_name
+        pending = getattr(writer, 'deferred_suite_vars', None)
+        if pending is None:
+            pending = []
+            writer.deferred_suite_vars = pending
+        pending.append(suite_var)
 
 def _vertical_dim_of(scheme_var) -> str:
     """Extract the vertical-axis standard name from a constituent
@@ -2960,6 +3097,7 @@ def _resolve_one_call(
     resolved_call = ResolvedCall(
         scheme_name=scheme_name, phase=phase,
         scheme_module=scheme_store.module_for(scheme_name),
+        language=scheme_store.language_for(scheme_name),
     )
     for scheme_var in vars_list:
         arg = _resolve_one_arg(
